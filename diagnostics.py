@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 
 import ai_search
+from ai_search import run_with_timeout
 from ai_search_config import APP_SUPPORT_DIR, EMBEDDING_MODEL, DEFAULT_MODEL
 
 APP_VERSION="1.0.0-rc1"
@@ -41,7 +42,7 @@ def _lance_ids(lance_dir: Path) -> tuple[set[str],str]:
     try:
         table=ai_search.lance_table(lance_dir)
         if not table: return set(),"chybí tabulka chunks"
-        rows=table.search().select(["id"]).to_arrow().column("id").to_pylist()
+        rows=run_with_timeout(lambda: table.search().select(["id"]).to_arrow().column("id").to_pylist(), 30, "lancedb diagnostics")
         return {value for value in rows if value!="__init__"},"ok"
     except Exception as exc: return set(),f"{type(exc).__name__}: {exc}"
 
