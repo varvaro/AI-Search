@@ -147,7 +147,12 @@ else:
         st.caption(f"Nalezeno: {len(rows)} dokumentů · čas {elapsed:.2f} s · režim {search_mode}")
         if not rows: st.warning("Nebyly nalezeny žádné odpovídající výsledky.")
         elif mode=="Položit otázku":
-            original=ai_search.COMPLEX_MODEL; ai_search.COMPLEX_MODEL="qwen3:14b" if deep else "qwen3:8b"; response=ai_search.answer(query,rows); ai_search.COMPLEX_MODEL=original
+            original_default,original_complex=ai_search.DEFAULT_MODEL,ai_search.COMPLEX_MODEL
+            try:
+                ai_search.DEFAULT_MODEL=settings.default_llm; ai_search.COMPLEX_MODEL=settings.deep_llm if deep else settings.default_llm
+                response=ai_search.answer(query,rows)
+            finally:
+                ai_search.DEFAULT_MODEL,ai_search.COMPLEX_MODEL=original_default,original_complex
             if not response.get("citations"): st.warning("V dostupných zdrojích jsem nenašel dostatek informací pro spolehlivou odpověď.")
             else:
                 st.subheader("Odpověď"); st.write(response["answer"]); st.subheader("Citace")
