@@ -1,0 +1,37 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+
+# Runtime state — obsahuje reálná firemní data (SQLite index, cesty, historie)
+.ai-search-state/
+
+# Environment / secrets
+.env
+.env.*
+
+# Streamlit
+.streamlit/
+
+# macOS
+.DS_Store
+
+# Editory
+.vscode/
+.cursor/
+
+# Logy
+*.log
+
+# Sestavená aplikace a dočasné soubory
+AI Search.app/
+tmp/
+
+# Lokální absolutní cesta specifická pro tento Mac (ověřit obsah před rozhodnutím)
+macos/project-path.txt
+
+# Interní/citlivá provozní dokumentace stavby — nepatří do zdrojového repozitáře
+Kontrola_predavaci_dokumentace_FERI.md
