@@ -304,7 +304,30 @@ def sync(root, db_path, lance_dir, embeddings, progress=None, stop_event=None):
         with database(db_path) as con:
             known={r[0]:r for r in con.execute("SELECT path,id,content_hash,size,mtime_ns,inode FROM documents")}
         report(progress,logger,"Načítám soubory",started=started)
-        paths=list(iter_documents(root)); current={str(p):p.stat() for p in paths}; total=len(paths)
+        if stop_event and stop_event.is_set():
+            counts["stopped"]=True; logger.info("STOP vyžádán před načtením souborů")
+            parsing_watchdog.close(); msg_watchdog.close(); embedding_watchdog.close()
+            return counts
+        paths=[]
+        for path in iter_documents(root):
+            if stop_event and stop_event.is_set():
+                counts["stopped"]=True; logger.info("STOP vyžádán během načítání souborů")
+                parsing_watchdog.close(); msg_watchdog.close(); embedding_watchdog.close()
+                return counts
+            paths.append(path)
+        current={}
+        for p in paths:
+            if stop_event and stop_event.is_set():
+                counts["stopped"]=True; logger.info("STOP vyžádán během statování souborů")
+                parsing_watchdog.close(); msg_watchdog.close(); embedding_watchdog.close()
+                return counts
+            try:
+                stat_value=run_with_timeout(lambda: p.stat(), PARSE_TIMEOUT_SECONDS, "stat")
+                current[str(p)]=stat_value
+            except (PhaseTimeout, Exception) as exc:
+                logger.warning("Přeskakuji soubor %s kvůli chybě stat: %s", p, exc)
+                continue
+        paths=[p for p in paths if str(p) in current]; total=len(paths)
         logger.info("celkem nalezených kandidátů: %s",total); by_inode={r[5]:r for r in known.values()}; by_hash={r[2]:r for r in known.values()}
         for number,path in enumerate(paths,1):
             if stop_event and stop_event.is_set(): counts["stopped"]=True; logger.info("STOP vyžádán; bezpečně ukončuji před dokumentem %s",number); break
@@ -406,7 +429,9 @@ def search(query, db_path, lance_dir, embeddings, limit=8):
     with database(db_path) as con: lexical=con.execute("SELECT chunk_id FROM chunks_fts WHERE chunks_fts MATCH ? LIMIT ?",(terms,limit*4)).fetchall() if terms else []
     scores={cid:1/(60+rank) for rank,(cid,) in enumerate(lexical)}; table=lance_table(lance_dir)
     if table:
-        for rank,row in enumerate(table.search(embeddings.encode([query])[0]).limit(limit*4).to_list()): scores[row["id"]]=scores.get(row["id"],0)+1/(60+rank)
+        query_vector=embeddings.encode([query])[0]
+        results=run_with_timeout(lambda: table.search(query_vector).limit(limit*4).to_list(), 30, "lancedb search")
+        for rank,row in enumerate(results): scores[row["id"]]=scores.get(row["id"],0)+1/(60+rank)
     # Přesná shoda dotazu v názvu dokumentu je silnější důkaz než
     # sémantická podobnost obecného textu dodacího listu.
     needle=query.casefold().strip(); output=[]
