@@ -9,10 +9,18 @@ from document_extractors import INDEXED_EXTS, extract_text
 SUPPORTED = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".txt", ".md", ".csv", ".rtf", ".eml", ".msg", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp"}
 
 def sha256_file(path):
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""): digest.update(block)
-    return digest.hexdigest()
+    result = [None]; error = [None]
+    def _read():
+        try:
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for block in iter(lambda: handle.read(1024 * 1024), b""): digest.update(block)
+            result[0] = digest.hexdigest()
+        except BaseException as exc: error[0] = exc
+    t = threading.Thread(target=_read, daemon=True); t.start(); t.join(PARSE_TIMEOUT_SECONDS)
+    if t.is_alive(): raise PhaseTimeout("hashování", PARSE_TIMEOUT_SECONDS)
+    if error[0] is not None: raise error[0]
+    return result[0]
 
 def connect(path):
     path.parent.mkdir(parents=True, exist_ok=True); con = sqlite3.connect(path,timeout=60)
