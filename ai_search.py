@@ -225,9 +225,9 @@ def extract(path):
     if ext in INDEXED_EXTS: return extract_text(path)
     if ext in {".txt", ".md", ".csv", ".rtf", ".eml"}: return path.read_text(encoding="utf-8", errors="replace"), "text"
     if ext in {".doc", ".xls"}:
-        run = subprocess.run(["/usr/bin/textutil", "-convert", "txt", "-stdout", str(path)], capture_output=True, check=False)
+        run = subprocess.run(["/usr/bin/textutil", "-convert", "txt", "-stdout", str(path)], capture_output=True, check=False, timeout=PARSE_TIMEOUT_SECONDS)
         return run.stdout.decode("utf-8", errors="replace"), "textutil"
-    run = subprocess.run(["/opt/homebrew/bin/tesseract", str(path), "stdout", "-l", "ces+eng"], capture_output=True, check=False)
+    run = subprocess.run(["/opt/homebrew/bin/tesseract", str(path), "stdout", "-l", "ces+eng"], capture_output=True, check=False, timeout=PARSE_TIMEOUT_SECONDS)
     return run.stdout.decode("utf-8", errors="replace"), "stav_skenu_ocr"
 
 def extract_pdf(path, budget_seconds=180):
