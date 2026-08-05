@@ -118,7 +118,10 @@ class EmbeddingWatchdog:
             while True:
                 elapsed=time.monotonic()-started; chunk_number=offset+1
                 if progress: progress(elapsed,chunk_number,len(output))
-                if elapsed>=limit: self.process.terminate(); self.process.join(5); raise PhaseTimeout("embedding",limit,chunk_number)
+                if elapsed>=limit:
+                    self.process.terminate(); self.process.join(5)
+                    if self.process.is_alive(): self.process=None
+                    raise PhaseTimeout("embedding",limit,chunk_number)
                 try: response_id,vectors,error=self.responses.get(timeout=min(.25,limit-elapsed))
                 except queue.Empty: continue
                 if response_id!=request_id: continue
@@ -127,7 +130,9 @@ class EmbeddingWatchdog:
         return output
     def close(self):
         if self.process and self.process.is_alive(): self.requests.put(None); self.process.join(5)
-        if self.process and self.process.is_alive(): self.process.terminate(); self.process.join(5)
+        if self.process and self.process.is_alive():
+            self.process.terminate(); self.process.join(5)
+            if self.process.is_alive(): self.process=None
 
 def _parsing_worker(requests,responses):
     while True:
@@ -151,7 +156,10 @@ class ParsingWatchdog:
         while True:
             elapsed=time.monotonic()-started
             if progress: progress(elapsed)
-            if elapsed>=limit: self.process.terminate(); self.process.join(5); raise PhaseTimeout("parsování",limit,0)
+            if elapsed>=limit:
+                self.process.terminate(); self.process.join(5)
+                if self.process.is_alive(): self.process=None
+                raise PhaseTimeout("parsování",limit,0)
             try: response_id,result,error=self.responses.get(timeout=min(.25,limit-elapsed))
             except queue.Empty: continue
             if response_id!=request_id: continue
@@ -159,7 +167,9 @@ class ParsingWatchdog:
             return result
     def close(self):
         if self.process and self.process.is_alive(): self.requests.put(None); self.process.join(5)
-        if self.process and self.process.is_alive(): self.process.terminate(); self.process.join(5)
+        if self.process and self.process.is_alive():
+            self.process.terminate(); self.process.join(5)
+            if self.process.is_alive(): self.process=None
 
 def extract_outlook_msg(path):
     import extract_msg
@@ -192,7 +202,10 @@ class MsgParsingWatchdog(ParsingWatchdog):
         while True:
             elapsed=time.monotonic()-started
             if progress: progress(elapsed)
-            if elapsed>=limit: self.process.terminate(); self.process.join(5); raise PhaseTimeout("msg_parsing",limit,0)
+            if elapsed>=limit:
+                self.process.terminate(); self.process.join(5)
+                if self.process.is_alive(): self.process=None
+                raise PhaseTimeout("msg_parsing",limit,0)
             try: response_id,result,error=self.responses.get(timeout=min(.25,limit-elapsed))
             except queue.Empty: continue
             if response_id!=request_id: continue
