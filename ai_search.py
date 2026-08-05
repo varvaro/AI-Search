@@ -22,6 +22,17 @@ def sha256_file(path):
     if error[0] is not None: raise error[0]
     return result[0]
 
+def run_with_timeout(operation, timeout_seconds, phase_name):
+    """Run operation in daemon thread with timeout."""
+    result = [None]; error = [None]
+    def _run():
+        try: result[0] = operation()
+        except BaseException as exc: error[0] = exc
+    t = threading.Thread(target=_run, daemon=True); t.start(); t.join(timeout_seconds)
+    if t.is_alive(): raise PhaseTimeout(phase_name, timeout_seconds)
+    if error[0] is not None: raise error[0]
+    return result[0]
+
 def connect(path):
     path.parent.mkdir(parents=True, exist_ok=True); con = sqlite3.connect(path,timeout=60)
     con.execute("PRAGMA busy_timeout=60000"); con.execute("PRAGMA synchronous=NORMAL"); con.execute("PRAGMA foreign_keys=ON")
@@ -337,11 +348,11 @@ def sync(root, db_path, lance_dir, embeddings, progress=None, stop_event=None):
                         for ordinal,(heading,body) in enumerate(pieces):
                             cid=f"{digest}:{ordinal}"; con.execute("INSERT INTO chunks VALUES(?,?,?,?,?)",(cid,doc_id,ordinal,heading,body)); con.execute("INSERT INTO chunks_fts(chunk_id,name,relative_path,project,heading,body) VALUES(?,?,?,?,?,?)",(cid,path.name,str(path.relative_to(root)),root.name,heading,body))
                         report(progress,logger,"LanceDB zápis",number,total,path,started)
-                        if table and old_chunk_ids: table.delete("id IN ("+ ",".join(json.dumps(i) for i in old_chunk_ids)+")")
+                        if table and old_chunk_ids: run_with_timeout(lambda: table.delete("id IN ("+ ",".join(json.dumps(i) for i in old_chunk_ids)+")"), EMBEDDING_TIMEOUT_SECONDS, "lancedb delete")
                         if table and additions:
-                            table.delete('id = "__init__"')
+                            run_with_timeout(lambda: table.delete('id = "__init__"'), EMBEDDING_TIMEOUT_SECONDS, "lancedb delete")
                             for row in additions: row["document_id"]=doc_id
-                            table.add(additions)
+                            run_with_timeout(lambda: table.add(additions), EMBEDDING_TIMEOUT_SECONDS, "lancedb add")
                     logger.info("SQLite COMMIT")
                 except Exception:
                     logger.exception("ROLLBACK")
@@ -378,7 +389,7 @@ def sync(root, db_path, lance_dir, embeddings, progress=None, stop_event=None):
             try:
                 with database(db_path) as con:
                     con.execute("BEGIN IMMEDIATE"); con.execute("DELETE FROM chunks_fts WHERE chunk_id IN (SELECT id FROM chunks WHERE document_id=?)",(row[1],)); con.execute("DELETE FROM documents WHERE id=?",(row[1],))
-                    if table and old_ids: table.delete("id IN ("+ ",".join(json.dumps(i) for i in old_ids)+")")
+                    if table and old_ids: run_with_timeout(lambda: table.delete("id IN ("+ ",".join(json.dumps(i) for i in old_ids)+")"), EMBEDDING_TIMEOUT_SECONDS, "lancedb delete")
                 counts["removed"]+=1
             except Exception:
                 if table and lance_version is not None: table.checkout(lance_version); table.restore(); table.checkout_latest()
