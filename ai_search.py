@@ -1,18 +1,12 @@
 #!/usr/bin/env python3
 """Hybridní backend AI Search nad lokální složkou Box Drive."""
 from __future__ import annotations
-import argparse, collections, contextlib, fcntl, gc, hashlib, importlib.util, json, logging, multiprocessing, os, queue, re, resource, sqlite3, subprocess, tempfile, threading, time, traceback, urllib.request, uuid
+import argparse, collections, contextlib, fcntl, gc, hashlib, json, logging, multiprocessing, os, queue, re, resource, sqlite3, subprocess, tempfile, threading, time, traceback, urllib.request, uuid
 from pathlib import Path
 from ai_search_config import BOX_ROOT, STATE_DIR, EMBEDDING_MODEL, OLLAMA_ENDPOINT, DEFAULT_MODEL, COMPLEX_MODEL, PARSE_TIMEOUT_SECONDS, CHUNK_TIMEOUT_SECONDS, EMBEDDING_TIMEOUT_SECONDS, EMBEDDING_BATCH_SIZE, MSG_PARSE_TIMEOUT_SECONDS
+from document_extractors import INDEXED_EXTS, extract_text
 
-CORE = Path("/Users/miroslavvarvarovsky/Documents/Codex/2026-08-02/referenced-chatgpt-conversation-this-is-an")
 SUPPORTED = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".txt", ".md", ".csv", ".rtf", ".eml", ".msg", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp"}
-
-def _core(name):
-    spec = importlib.util.spec_from_file_location("stav_skenu_" + name, CORE / (name + ".py"))
-    if not spec or not spec.loader: raise RuntimeError("Chybí jádro Stav skenů")
-    module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module); return module
-box_index, scan_filer = _core("box_index"), _core("scan_filer")
 
 def sha256_file(path):
     digest = hashlib.sha256()
@@ -207,7 +201,7 @@ def iter_documents(root):
 def extract(path):
     ext = path.suffix.lower()
     if ext == ".pdf": return extract_pdf(path), "stav_skenu_pdf"
-    if ext in box_index.INDEXED_EXTS: return box_index.extract_text(path)
+    if ext in INDEXED_EXTS: return extract_text(path)
     if ext in {".txt", ".md", ".csv", ".rtf", ".eml"}: return path.read_text(encoding="utf-8", errors="replace"), "text"
     if ext in {".doc", ".xls"}:
         run = subprocess.run(["/usr/bin/textutil", "-convert", "txt", "-stdout", str(path)], capture_output=True, check=False)
