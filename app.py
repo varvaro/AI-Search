@@ -114,7 +114,7 @@ if st.session_state.page=="diagnostics":
     if st.button("Zpět k hledání",key="diagnostics-back"): st.session_state.page="search"; st.rerun()
 elif st.session_state.page=="settings":
     st.header("Nastavení"); select_folder("projekt",settings.project_root,"project_root","settings"); select_folder("e-maily",settings.email_root,"email_root","settings"); select_folder("poznámky",settings.notes_root,"notes_root","settings")
-    settings.default_llm=st.selectbox("Výchozí jazykový model",["qwen3:8b","qwen3:14b"],index=0 if settings.default_llm=="qwen3:8b" else 1); st.caption(f"Embeddingový model: {ai_search.EMBEDDING_MODEL} (změna vyžaduje reindexaci)"); settings.ocr=st.toggle("Používat OCR",settings.ocr); settings.result_count=st.slider("Počet výsledků",8,50,max(8,settings.result_count))
+    settings.default_llm=st.selectbox("Výchozí jazykový model",["qwen3:8b","qwen3:14b"],index=0 if settings.default_llm=="qwen3:8b" else 1); st.caption(f"Embeddingový model: {ai_search.EMBEDDING_MODEL} (změna vyžaduje reindexaci)"); st.caption("OCR: automaticky aktivní pro skenované dokumenty"); settings.result_count=st.slider("Počet výsledků",8,50,max(8,settings.result_count))
     if st.button("Uložit nastavení",type="primary"): save_settings(SETTINGS,settings); st.success("Nastavení bylo uloženo.")
     c1,c2=st.columns(2)
     if c1.button("Importovat e-maily",disabled=not bool(settings.email_root)):
