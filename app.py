@@ -63,7 +63,7 @@ with st.sidebar:
     a,b=st.columns(2); a.metric("PDF",summary["pdf"]); b.metric("E-maily",summary["emails"])
     a,b=st.columns(2); a.metric("Poznámky",summary["notes"]); b.metric("Dokumenty",summary["total"])
     st.caption(f"Velikost indexu: {summary['size_bytes']/1024/1024:.1f} MB")
-    st.caption(f"Synchronizace: {summary['latest']}"); st.caption(f"Embedding: {settings.embedding_model}"); st.caption(f"LLM: {settings.default_llm}")
+    st.caption(f"Synchronizace: {summary['latest']}"); st.caption(f"Embedding: {ai_search.EMBEDDING_MODEL}"); st.caption(f"LLM: {settings.default_llm}")
     st.write("Ollama", "🟢 Běží" if ollama_status() else "🔴 Není dostupná")
     job=st.session_state.get("index_job"); running=bool(job and job["thread"].is_alive())
     if st.button("Aktualizovat index",type="primary",use_container_width=True,disabled=not bool(settings.project_root) or running):
@@ -114,7 +114,7 @@ if st.session_state.page=="diagnostics":
     if st.button("Zpět k hledání",key="diagnostics-back"): st.session_state.page="search"; st.rerun()
 elif st.session_state.page=="settings":
     st.header("Nastavení"); select_folder("projekt",settings.project_root,"project_root","settings"); select_folder("e-maily",settings.email_root,"email_root","settings"); select_folder("poznámky",settings.notes_root,"notes_root","settings")
-    settings.default_llm=st.selectbox("Výchozí jazykový model",["qwen3:8b","qwen3:14b"],index=0 if settings.default_llm=="qwen3:8b" else 1); settings.embedding_model=st.text_input("Embeddingový model",settings.embedding_model); settings.ocr=st.toggle("Používat OCR",settings.ocr); settings.result_count=st.slider("Počet výsledků",8,50,max(8,settings.result_count))
+    settings.default_llm=st.selectbox("Výchozí jazykový model",["qwen3:8b","qwen3:14b"],index=0 if settings.default_llm=="qwen3:8b" else 1); st.caption(f"Embeddingový model: {ai_search.EMBEDDING_MODEL} (změna vyžaduje reindexaci)"); settings.ocr=st.toggle("Používat OCR",settings.ocr); settings.result_count=st.slider("Počet výsledků",8,50,max(8,settings.result_count))
     if st.button("Uložit nastavení",type="primary"): save_settings(SETTINGS,settings); st.success("Nastavení bylo uloženo.")
     c1,c2=st.columns(2)
     if c1.button("Importovat e-maily",disabled=not bool(settings.email_root)):
@@ -125,7 +125,7 @@ elif st.session_state.page=="settings":
         else: st.error("Složka poznámek neexistuje. Vyberte ji znovu.")
     if st.button("Zpět k hledání"): st.session_state.page="search"; st.rerun()
 elif st.session_state.page=="history":
-    st.header("Historie a diagnostika"); st.write("Ollama:","běží" if ollama_status() else "není dostupná"); st.write("Embeddingový model:",settings.embedding_model); st.write("Výchozí LLM:",settings.default_llm)
+    st.header("Historie a diagnostika"); st.write("Ollama:","běží" if ollama_status() else "není dostupná"); st.write("Embeddingový model:",ai_search.EMBEDDING_MODEL); st.write("Výchozí LLM:",settings.default_llm)
     history=read_history(STATE)
     if history: st.dataframe(history,use_container_width=True,hide_index=True)
     else: st.info("Historie je zatím prázdná. Proveďte první indexaci.")
