@@ -7,12 +7,14 @@ from streamlit.testing.v1 import AppTest
 import ai_search
 import ui_services as ui
 
+APP_PATH = Path(__file__).parent.parent / "app.py"
+
 class FakeEmbeddings:
     def encode(self,texts): return [[1.0,0.5,0.1] for _ in texts]
 
 def test_ui_starts_in_czech(tmp_path,monkeypatch):
     monkeypatch.setattr(ui,"ollama_status",lambda:False)
-    app=AppTest.from_file("app.py",default_timeout=10).run()
+    app=AppTest.from_file(str(APP_PATH),default_timeout=10).run()
     assert not app.exception
     assert any("Najděte informace" in h.value for h in app.header)
     assert any("Aktualizovat index" in b.label for b in app.button)
@@ -183,7 +185,7 @@ def test_system_overview_counts_and_size(tmp_path):
 
 @pytest.mark.parametrize("page,heading",[("settings","Nastavení"),("history","Historie a diagnostika"),("diagnostics","Diagnostika")])
 def test_secondary_screens_render(page,heading):
-    app=AppTest.from_file("app.py",default_timeout=10); app.session_state["page"]=page; app.run()
+    app=AppTest.from_file(str(APP_PATH),default_timeout=10); app.session_state["page"]=page; app.run()
     assert not app.exception and any(heading in item.value for item in app.header)
 
 def _mock_ready_ui(monkeypatch,tmp_path,rows):
@@ -199,7 +201,7 @@ def test_twenty_plus_results_are_lazy_and_compact(tmp_path,monkeypatch):
         path=tmp_path/(f"Velmi dlouhý název dokumentu číslo {i} s technickým popisem.pdf")
         rows.append({"document":path.name,"title":path.name,"path":str(path),"project":"Projekt","quote":"Hydroizolace Pentaflex musí být provedena kolem výztuže. "+("Technický kontext. "*12),"score":1/(i+1),"source":"Dokument","date":"2026-08-04","extension":"pdf","author":""})
     _mock_ready_ui(monkeypatch,tmp_path,rows)
-    app=AppTest.from_file("app.py",default_timeout=10).run(); app.text_input[0].input("Pentaflex").run()
+    app=AppTest.from_file(str(APP_PATH),default_timeout=10).run(); app.text_input[0].input("Pentaflex").run()
     assert not app.exception
     assert any("Výsledky (24)" in h.value for h in app.subheader)
     assert len([b for b in app.button if b.label=="Náhled"])==8
@@ -207,7 +209,7 @@ def test_twenty_plus_results_are_lazy_and_compact(tmp_path,monkeypatch):
 
 def test_no_results_screen(tmp_path,monkeypatch):
     _mock_ready_ui(monkeypatch,tmp_path,[])
-    app=AppTest.from_file("app.py",default_timeout=10).run(); app.text_input[0].input("nenalezitelný výraz").run()
+    app=AppTest.from_file(str(APP_PATH),default_timeout=10).run(); app.text_input[0].input("nenalezitelný výraz").run()
     assert not app.exception and any("Nebyly nalezeny" in warning.value for warning in app.warning)
 
 def test_ui_search_uses_the_configured_query_expansion_branch(tmp_path,monkeypatch):
@@ -220,7 +222,7 @@ def test_ui_search_uses_the_configured_query_expansion_branch(tmp_path,monkeypat
     seen={}
     _mock_ready_ui(monkeypatch,tmp_path,[])
     monkeypatch.setattr(ui,"search_all",lambda *a,**k:(seen.update(k),[])[1])
-    app=AppTest.from_file("app.py",default_timeout=10).run(); app.text_input[0].input("Pentaflex").run()
+    app=AppTest.from_file(str(APP_PATH),default_timeout=10).run(); app.text_input[0].input("Pentaflex").run()
     assert not app.exception
     assert ai_search_config.QUERY_EXPANSION_MODE=="fts"
     assert seen.get("expand_query")==ai_search_config.QUERY_EXPANSION_MODE
@@ -229,6 +231,6 @@ def test_ai_citations_render_as_blocks(tmp_path,monkeypatch):
     path=tmp_path/"citovaný dokument.pdf"; path.write_bytes(b"pdf")
     row={"document":path.name,"title":path.name,"path":str(path),"project":"Projekt","quote":"Citovaný kontext dokumentu s dostatečnou délkou. "+("Další věta. "*12),"score":1.0,"source":"Dokument","date":"2026-08-04","extension":"pdf","author":""}
     _mock_ready_ui(monkeypatch,tmp_path,[row]); monkeypatch.setattr(ai_search,"answer",lambda *a,**k:{"answer":"Ověřená odpověď [1].","citations":[row]})
-    app=AppTest.from_file("app.py",default_timeout=10).run(); app.text_input[0].input("Jaký je závěr?").run()
+    app=AppTest.from_file(str(APP_PATH),default_timeout=10).run(); app.text_input[0].input("Jaký je závěr?").run()
     assert not app.exception and any("Odpověď" in h.value for h in app.subheader)
     assert any(b.label=="Přejít na citovaný dokument" for b in app.button)
