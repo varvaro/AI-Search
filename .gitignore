@@ -6,15 +6,28 @@ __pycache__/
 .mypy_cache/
 *.egg-info/
 
-# Runtime state — obsahuje reálná firemní data (SQLite index, cesty, historie)
+# Runtime state — obsahuje reálná firemní data (SQLite index, cesty, historie).
+# .ai-search-state.disabled-* chrání i přejmenované zálohy vzniklé při bezpečné
+# reindexaci (legacy adresář se dočasně přejmenuje, aby ho ensure_runtime_layout()
+# nerestauroval) — bez tohoto vzoru přejmenovaná záloha z ochrany .gitignore
+# vypadne a reálná produkční SQLite/LanceDB data by šla omylem commitnout.
 .ai-search-state/
+.ai-search-state.disabled-*/
+
+# Produkční SQLite/LanceDB adresáře — ať vznikly kdekoli v repozitáři (běžný
+# layout je STATE_DIR/database/*.sqlite3 a STATE_DIR/lance/*, viz
+# ui_services.ensure_runtime_layout/state_paths). Bez lomítka na konci by šlo
+# o soubory i adresáře; zde jde výhradně o adresáře s runtime daty.
+database/
+lance/
 
 # Environment / secrets
 .env
 .env.*
 
-# Streamlit
-.streamlit/
+# Streamlit — config.toml (vizuální téma z UI_AUDIT_AI_SEARCH_v1_1.md) má být
+# verzovaný, secrets.toml nikdy nesmí být commitnutý.
+.streamlit/secrets.toml
 
 # macOS
 .DS_Store
@@ -35,3 +48,10 @@ macos/project-path.txt
 
 # Interní/citlivá provozní dokumentace stavby — nepatří do zdrojového repozitáře
 Kontrola_predavaci_dokumentace_FERI.md
+
+# Benchmark run artifacts/reports — generated, timestamp-specific; production
+# runs can embed real Box document/folder names, so they must not be committed
+# (same rationale as .ai-search-state/ above). The dataset/*.jsonl files and
+# the benchmark/ code itself ARE tracked.
+benchmark/runs/*.json
+benchmark/reports/
