@@ -35,12 +35,15 @@ lance/
 # Editory
 .vscode/
 .cursor/
+.agents/
+.claude/
 
 # Logy
 *.log
 
 # Sestavená aplikace a dočasné soubory
 AI Search.app/
+/AI Search
 tmp/
 
 # Lokální absolutní cesta specifická pro tento Mac (ověřit obsah před rozhodnutím)
