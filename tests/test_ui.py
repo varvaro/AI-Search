@@ -36,7 +36,7 @@ def test_search_results_are_unique_by_path(tmp_path,monkeypatch):
 
 def test_search_requests_enough_chunks_for_lazy_results(tmp_path,monkeypatch):
     settings=ui.Settings(project_root=str(tmp_path),result_count=20); db,_=ui.state_paths(tmp_path,"Dokument"); db.touch(); captured={}
-    def fake_search(*args): captured["limit"]=args[-1]; return []
+    def fake_search(*args,**kwargs): captured["limit"]=args[-1]; return []
     monkeypatch.setattr(ai_search,"search",fake_search)
     ui.search_all("x",settings,tmp_path,FakeEmbeddings())
     assert captured["limit"]>=80
@@ -92,6 +92,36 @@ def test_context_is_meaningful_and_bounded():
     assert 150<=len(excerpt)<=302 and "Pentaflex" in excerpt
     assert len(ui.context_excerpt("A","A"))>20
 
+@pytest.mark.parametrize("query",["Pentaflex","kniha betonů","změnový list","hydroizolace základové desky","FERI"])
+def test_classify_query_detects_document_lookup(query):
+    assert ui.classify_query(query)=={"mode":"dokument","deep":False}
+
+@pytest.mark.parametrize("query",["Jaké doklady potřebuji k předání základové desky?","Co musí dodat zhotovitel po betonáži?","Jaké jsou požadavky investora?","Co chybí k předání?"])
+def test_classify_query_detects_question(query):
+    assert ui.classify_query(query)["mode"]=="otazka"
+
+@pytest.mark.parametrize("query",["Jaké jsou požadavky na dokumentaci?","Co chybí k předání díla?","Zkontroluj všechny dokumenty","Porovnej revize smlouvy","Shrň rizika a povinnosti zhotovitele"])
+def test_classify_query_detects_deep_analysis(query):
+    result=ui.classify_query(query); assert result["mode"]=="otazka" and result["deep"] is True
+
+def test_classify_query_empty_defaults_to_document():
+    assert ui.classify_query("")=={"mode":"dokument","deep":False}
+
+def test_match_reason_combined():
+    row={"match":{"fts_hit":True,"vector_hit":True,"semantic_similarity":0.89,"filename_match":False}}
+    reason=ui.match_reason(row); assert "kombinovaná" in reason and "89 %" in reason
+
+def test_match_reason_lexical_only():
+    row={"match":{"fts_hit":True,"vector_hit":False,"semantic_similarity":0.0,"filename_match":False}}
+    assert "klíčová slova" in ui.match_reason(row)
+
+def test_match_reason_semantic_only():
+    row={"match":{"fts_hit":False,"vector_hit":True,"semantic_similarity":0.42,"filename_match":False}}
+    assert "významová" in ui.match_reason(row) and "42 %" in ui.match_reason(row)
+
+def test_match_reason_missing_returns_empty():
+    assert ui.match_reason({})==""
+
 def test_human_relevance_labels():
     assert "Vysoká" in ui.match_label(1.0,1.0)
     assert "Střední" in ui.match_label(0.5,1.0)
@@ -112,6 +142,38 @@ def test_preview_text_and_missing(tmp_path):
     text=tmp_path/"note.md"; text.write_text("Český náhled")
     assert ui.preview_document(text)["content"]=="Český náhled"
     assert ui.preview_document(tmp_path/"missing.pdf")["kind"]=="error"
+
+def test_render_pdf_first_page_writes_png(tmp_path,monkeypatch):
+    fake_bin=tmp_path/"pdftoppm"; fake_bin.write_text("stub"); monkeypatch.setattr(ui,"PDFTOPPM_BIN",str(fake_bin))
+    def fake_runner(args,**kwargs):
+        prefix=Path(args[-1]); (prefix.parent/f"{prefix.name}-1.png").write_bytes(b"PNGDATA")
+        class Result: returncode=0
+        return Result()
+    assert ui.render_pdf_first_page(tmp_path/"doc.pdf",runner=fake_runner)==b"PNGDATA"
+
+def test_render_pdf_first_page_returns_none_on_failure(tmp_path,monkeypatch):
+    fake_bin=tmp_path/"pdftoppm"; fake_bin.write_text("stub"); monkeypatch.setattr(ui,"PDFTOPPM_BIN",str(fake_bin))
+    class Result: returncode=1
+    assert ui.render_pdf_first_page(tmp_path/"doc.pdf",runner=lambda *a,**k:Result()) is None
+
+def test_render_pdf_first_page_returns_none_on_timeout(tmp_path,monkeypatch):
+    fake_bin=tmp_path/"pdftoppm"; fake_bin.write_text("stub"); monkeypatch.setattr(ui,"PDFTOPPM_BIN",str(fake_bin))
+    def timeout_runner(*a,**k): raise subprocess.TimeoutExpired(cmd="pdftoppm",timeout=20)
+    assert ui.render_pdf_first_page(tmp_path/"doc.pdf",runner=timeout_runner) is None
+
+def test_render_pdf_first_page_returns_none_when_binary_missing(tmp_path,monkeypatch):
+    monkeypatch.setattr(ui,"PDFTOPPM_BIN",str(tmp_path/"does-not-exist"))
+    assert ui.render_pdf_first_page(tmp_path/"doc.pdf",runner=lambda *a,**k:(_ for _ in ()).throw(AssertionError("should not run"))) is None
+
+def test_preview_document_uses_image_when_rendering_succeeds(tmp_path,monkeypatch):
+    pdf=tmp_path/"scan.pdf"; pdf.write_bytes(b"%PDF-test")
+    monkeypatch.setattr(ui,"render_pdf_first_page",lambda path,**k:b"PNGDATA")
+    preview=ui.preview_document(pdf); assert preview["kind"]=="image"
+
+def test_preview_document_falls_back_to_download_when_rendering_fails(tmp_path,monkeypatch):
+    pdf=tmp_path/"scan.pdf"; pdf.write_bytes(b"%PDF-test")
+    monkeypatch.setattr(ui,"render_pdf_first_page",lambda path,**k:None)
+    preview=ui.preview_document(pdf); assert preview["kind"]=="pdf"
 
 def test_system_overview_counts_and_size(tmp_path):
     db,_=ui.state_paths(tmp_path,"Dokument"); con=ai_search.connect(db)

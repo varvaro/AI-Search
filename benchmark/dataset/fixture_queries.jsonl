@@ -1,0 +1,45 @@
+# Fixture-environment cases: run against the small synthetic corpus in
+# benchmark/fixtures.py (21 documents + FakeCategoryEmbeddings), not the real
+# production index. Fast, deterministic, no network/model download - this is
+# what `python -m benchmark run` (no flags) executes by default and what CI
+# should run on every PR touching ai_search.py/ui_services.py.
+#
+# These mirror tests/test_search_relevance.py's 33 (query, expected_document,
+# max_rank) cases, adapted to this dataset's schema. Intentional difference:
+# tests/test_search_relevance.py pins an exact max rank (tight, fails loudly
+# on any regression); this benchmark instead tracks recall/precision/MRR/nDCG
+# trends over time at a fixed k=10 - complementary, not a duplicate. Add new
+# cases here by copying a line and editing it; no code changes needed.
+{"id": "fx-kniha-betonu-01", "question": "kniha betonů", "type": "lookup", "difficulty": "easy", "expected_documents": ["kniha_betonu.txt"], "tags": ["beton"]}
+{"id": "fx-dodaci-listy-01", "question": "Jaké dodací listy máme od dodavatele betonu?", "type": "factual", "difficulty": "medium", "expected_documents": ["dodaci_listy_betonu.txt"], "tags": ["beton"]}
+{"id": "fx-zkousky-betonu-01", "question": "Kde najdu výsledky tlakových zkoušek betonových krychlí?", "type": "factual", "difficulty": "medium", "expected_documents": ["protokoly_zkousek_betonu.txt"], "tags": ["beton"]}
+{"id": "fx-vykresy-vyztuze-01", "question": "kladečské výkresy výztuže", "type": "lookup", "difficulty": "easy", "expected_documents": ["kladecke_vykresy_vyztuze.txt"], "tags": ["vyztuz"]}
+{"id": "fx-kontrola-vyztuze-01", "question": "Jak se kontroluje výztuž před betonáží?", "type": "factual", "difficulty": "medium", "expected_documents": ["kontrola_vyztuze_pred_betonazi.txt"], "tags": ["vyztuz"]}
+{"id": "fx-kotevni-delky-01", "question": "Jaké jsou kotevní délky výztužných prutů?", "type": "factual", "difficulty": "hard", "expected_documents": ["kladecke_vykresy_vyztuze.txt"], "tags": ["vyztuz"]}
+{"id": "fx-hydroizolace-navrh-01", "question": "návrh hydroizolace základů", "type": "lookup", "difficulty": "easy", "expected_documents": ["navrh_hydroizolace_zakladu.txt"], "tags": ["hydroizolace"]}
+{"id": "fx-hydroizolace-montaz-01", "question": "Jak se provádí montáž hydroizolační fólie?", "type": "factual", "difficulty": "medium", "expected_documents": ["montaz_hydroizolacni_folie.txt"], "tags": ["hydroizolace"]}
+{"id": "fx-hydroizolace-ochrana-01", "question": "Jak je zajištěna ochrana základů proti zemní vlhkosti?", "type": "factual", "difficulty": "hard", "expected_documents": ["navrh_hydroizolace_zakladu.txt"], "tags": ["hydroizolace"]}
+{"id": "fx-pentaflex-list-01", "question": "Pentaflex technický list", "type": "lookup", "difficulty": "easy", "expected_documents": ["pentaflex_technicky_list.txt"], "tags": ["pentaflex"]}
+{"id": "fx-pentaflex-montaz-01", "question": "Jaký je montážní postup těsnicího pásu Pentaflex?", "type": "factual", "difficulty": "medium", "expected_documents": ["pentaflex_montazni_postup.txt"], "tags": ["pentaflex"]}
+{"id": "fx-pentaflex-osazeni-01", "question": "Jak se osazuje těsnicí pás do pracovní spáry základové desky?", "type": "factual", "difficulty": "hard", "expected_documents": ["pentaflex_technicky_list.txt"], "tags": ["pentaflex"]}
+{"id": "fx-pentaflex-short-01", "question": "Pentaflex", "type": "lookup", "difficulty": "easy", "expected_documents": ["pentaflex_technicky_list.txt"], "tags": ["pentaflex"]}
+{"id": "fx-geodeticke-zamereni-01", "question": "geodetické zaměření základové desky", "type": "lookup", "difficulty": "easy", "expected_documents": ["geodeticke_zamereni_desky.txt"], "tags": ["zakladova_deska"]}
+{"id": "fx-stavebni-denik-01", "question": "Co se eviduje ve stavebním deníku na základech?", "type": "factual", "difficulty": "medium", "expected_documents": ["stavebni_denik_zaklady.txt"], "tags": ["zakladova_deska"]}
+{"id": "fx-vyskove-osazeni-01", "question": "Jaké je výškové osazení bednění základové desky?", "type": "factual", "difficulty": "hard", "expected_documents": ["geodeticke_zamereni_desky.txt"], "tags": ["zakladova_deska"]}
+{"id": "fx-zmenovy-list-desky-01", "question": "změnový list základové desky", "type": "lookup", "difficulty": "easy", "expected_documents": ["zmenovy_list_01.txt"], "tags": ["zmenove_listy"]}
+{"id": "fx-zmenovy-list-short-01", "question": "změnový list", "type": "lookup", "difficulty": "easy", "expected_documents": ["zmenovy_list_01.txt"], "tags": ["zmenove_listy"]}
+{"id": "fx-registr-zmen-01", "question": "Kde je registr schválených změn projektu?", "type": "factual", "difficulty": "medium", "expected_documents": ["registr_zmen_projektu.txt"], "tags": ["zmenove_listy"]}
+{"id": "fx-registr-zmen-rozpocet-01", "question": "Jaký dopad mají schválené změny na rozpočet?", "type": "factual", "difficulty": "hard", "expected_documents": ["registr_zmen_projektu.txt"], "tags": ["zmenove_listy"]}
+{"id": "fx-sod-hlavni-01", "question": "smlouva o dílo hlavní", "type": "lookup", "difficulty": "easy", "expected_documents": ["smlouva_o_dilo_hlavni.txt"], "tags": ["sod"]}
+{"id": "fx-sod-dodatek-01", "question": "Jaký dodatek upravuje termín a cenu víceprací?", "type": "factual", "difficulty": "medium", "expected_documents": ["dodatek_smlouvy_o_dilo.txt"], "tags": ["sod"]}
+{"id": "fx-sod-pokuty-01", "question": "Jaké smluvní pokuty hrozí zhotoviteli?", "type": "factual", "difficulty": "hard", "expected_documents": ["smlouva_o_dilo_hlavni.txt"], "tags": ["sod"]}
+{"id": "fx-bozp-plan-01", "question": "plán BOZP staveniště", "type": "lookup", "difficulty": "easy", "expected_documents": ["plan_bozp_staveniste.txt"], "tags": ["bozp"]}
+{"id": "fx-bozp-skoleni-01", "question": "Kde je záznam o proškolení pracovníků BOZP?", "type": "factual", "difficulty": "medium", "expected_documents": ["zaznam_o_skoleni_bozp.txt"], "tags": ["bozp"]}
+{"id": "fx-bozp-opatreni-01", "question": "Jaká bezpečnostní opatření platí na staveništi?", "type": "factual", "difficulty": "hard", "expected_documents": ["plan_bozp_staveniste.txt"], "tags": ["bozp"]}
+{"id": "fx-kontrolni-den-05-01", "question": "zápis kontrolního dne číslo 5", "type": "lookup", "difficulty": "easy", "expected_documents": ["zapis_kontrolniho_dne_05.txt"], "tags": ["kontrolni_dny"]}
+{"id": "fx-harmonogram-jednani-01", "question": "Jaký je harmonogram jednání investora a zhotovitele?", "type": "factual", "difficulty": "medium", "expected_documents": ["harmonogram_kontrolnich_dnu.txt"], "tags": ["kontrolni_dny"]}
+{"id": "fx-jednani-pravidelnost-01", "question": "Kdy se konají pravidelná jednání investora se zhotovitelem?", "type": "factual", "difficulty": "hard", "expected_documents": ["harmonogram_kontrolnich_dnu.txt"], "tags": ["kontrolni_dny"]}
+{"id": "fx-predavaci-protokol-01", "question": "předávací protokol základové desky", "type": "lookup", "difficulty": "easy", "expected_documents": ["predavaci_protokol_zakladove_desky.txt"], "tags": ["predani_dila"]}
+{"id": "fx-doklady-predani-01", "question": "Jaké doklady jsou potřeba k předání díla?", "type": "checklist", "difficulty": "medium", "expected_documents": ["soupis_dokladu_k_predani.txt"], "tags": ["predani_dila"]}
+{"id": "fx-predani-desky-investorovi-01", "question": "Jaký dokument dokládá předání základové desky investorovi?", "type": "checklist", "difficulty": "hard", "expected_documents": ["predavaci_protokol_zakladove_desky.txt"], "tags": ["predani_dila"]}
+{"id": "fx-doklady-po-betonazi-01", "question": "Jaké doklady musí dodat zhotovitel po betonáži?", "type": "checklist", "difficulty": "hard", "expected_documents": ["kniha_betonu.txt"], "tags": ["beton", "predani_dila"]}

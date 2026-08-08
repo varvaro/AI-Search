@@ -77,6 +77,69 @@ def test_embedding_wrapper_loads_configured_model(monkeypatch):
     assert loaded["name"] == ai_search.EMBEDDING_MODEL
 
 
+# ---------------------------------------------------------------------------
+# CrossEncoderReranker (2026-08-06 cross-encoder precision reranker) - unit
+# tests against a fake sentence_transformers.CrossEncoder, so these never
+# download/load the real ~2GB BAAI/bge-reranker-v2-m3 model. Real-model
+# behaviour is exercised separately by the production benchmark
+# (candidate_strategy="union_ce").
+# ---------------------------------------------------------------------------
+
+class _FakeSTCrossEncoder:
+    """Stand-in for sentence_transformers.CrossEncoder: records how many times
+    it was constructed (to prove lazy-loading/no-reload) and returns a
+    deterministic score per (query, passage) pair based on passage length."""
+    instances_created = 0
+    def __init__(self, name, max_length=None):
+        _FakeSTCrossEncoder.instances_created += 1
+        self.name = name; self.max_length = max_length
+    def predict(self, pairs, batch_size=32):
+        import numpy as np
+        return np.array([float(len(passage)) for _, passage in pairs])
+
+
+def test_cross_encoder_reranker_lazy_loads_model_only_on_first_score_call(monkeypatch):
+    monkeypatch.setattr("sentence_transformers.CrossEncoder", _FakeSTCrossEncoder)
+    _FakeSTCrossEncoder.instances_created = 0
+    reranker = ai_search.CrossEncoderReranker()
+    assert reranker.model is None, "model must not load at construction time"
+    reranker.score("dotaz", ["krátký", "mnohem delší text"])
+    assert reranker.model is not None
+    assert _FakeSTCrossEncoder.instances_created == 1
+
+
+def test_cross_encoder_reranker_does_not_reload_model_across_repeated_calls(monkeypatch):
+    monkeypatch.setattr("sentence_transformers.CrossEncoder", _FakeSTCrossEncoder)
+    _FakeSTCrossEncoder.instances_created = 0
+    reranker = ai_search.CrossEncoderReranker()
+    reranker.score("dotaz", ["a"])
+    reranker.score("jiný dotaz", ["b", "c"])
+    reranker.score("třetí dotaz", [])
+    assert _FakeSTCrossEncoder.instances_created == 1, "the underlying model must be constructed exactly once, not once per query"
+
+
+def test_cross_encoder_reranker_score_matches_passage_order_and_count(monkeypatch):
+    monkeypatch.setattr("sentence_transformers.CrossEncoder", _FakeSTCrossEncoder)
+    reranker = ai_search.CrossEncoderReranker()
+    passages = ["x", "xxxxx", "xxx"]
+    scores = reranker.score("dotaz", passages)
+    assert scores == [1.0, 5.0, 3.0], "scores must be a plain list, same length/order as passages"
+
+
+def test_cross_encoder_reranker_score_of_empty_passages_is_empty_list_without_loading_model(monkeypatch):
+    monkeypatch.setattr("sentence_transformers.CrossEncoder", _FakeSTCrossEncoder)
+    _FakeSTCrossEncoder.instances_created = 0
+    reranker = ai_search.CrossEncoderReranker()
+    assert reranker.score("dotaz", []) == []
+    assert _FakeSTCrossEncoder.instances_created == 0, "no passages means no reason to ever load the model"
+
+
+def test_get_default_cross_encoder_returns_the_same_instance_every_time():
+    first = ai_search._get_default_cross_encoder()
+    second = ai_search._get_default_cross_encoder()
+    assert first is second
+
+
 def test_fts5_search(backend):
     _, state, _, _ = backend
     con = ai_search.connect(state / "index.sqlite3")
@@ -278,6 +341,47 @@ def test_phase_watchdog_records_timeout_and_continues(tmp_path,monkeypatch,phase
     assert status[0]=="ERROR_TIMEOUT" and "fáze=" in status[1]
     log=(tmp_path/"runtime/logs/index.log").read_text()
     assert "ERROR_TIMEOUT" in log and "Traceback" in log
+
+
+def test_embedding_timeout_config_value():
+    """The raise from 60 s to 300 s (Fáze 3.2). 60 s was already being hit in
+    production before the reindex: the slow-phase log recorded embedding
+    timeouts on .xls documents holding as few as 9 monolithic chunks."""
+    import ai_search_config
+    assert ai_search_config.EMBEDDING_TIMEOUT_SECONDS == 300
+    assert ai_search.EMBEDDING_TIMEOUT_SECONDS == ai_search_config.EMBEDDING_TIMEOUT_SECONDS
+
+
+def test_embedding_timeout_is_read_from_config_not_hardcoded(tmp_path,monkeypatch):
+    """sync() must pass the configured value through to the watchdog. Changing
+    the constant has to be enough to change the real limit - the existing
+    ERROR_TIMEOUT test above proves a low value still trips, this proves the
+    exact value reaches EmbeddingWatchdog.encode()."""
+    root=tmp_path/"root"; root.mkdir(); (root/"a.txt").write_text("obsah dokumentu")
+    seen=[]
+    class RecordingWatchdog(ai_search.EmbeddingWatchdog):
+        def encode(self,texts,limit,progress=None):
+            seen.append(limit); return super().encode(texts,limit,progress)
+    monkeypatch.setattr(ai_search,"EmbeddingWatchdog",RecordingWatchdog)
+    monkeypatch.setattr(ai_search,"EMBEDDING_TIMEOUT_SECONDS",1234)
+    ai_search.sync(root,tmp_path/"db.sqlite3",tmp_path/"lance",FakeEmbeddings())
+    assert seen==[1234]
+
+
+def test_lancedb_writes_share_the_embedding_timeout(tmp_path,monkeypatch):
+    """The same constant also bounds the LanceDB add/delete calls, so raising
+    it raises those too - asserted so the coupling is not discovered by
+    accident later."""
+    root=tmp_path/"root"; root.mkdir(); (root/"a.txt").write_text("obsah dokumentu")
+    seen=[]
+    real=ai_search.run_with_timeout
+    def recording(operation,timeout_seconds,phase_name):
+        seen.append((phase_name,timeout_seconds)); return real(operation,timeout_seconds,phase_name)
+    monkeypatch.setattr(ai_search,"run_with_timeout",recording)
+    monkeypatch.setattr(ai_search,"EMBEDDING_TIMEOUT_SECONDS",1234)
+    ai_search.sync(root,tmp_path/"db.sqlite3",tmp_path/"lance",FakeEmbeddings())
+    lance_calls=[limit for phase,limit in seen if phase.startswith("lancedb")]
+    assert lance_calls and all(limit==1234 for limit in lance_calls)
 
 
 def test_outlook_msg_parser_extracts_standard_fields(tmp_path,monkeypatch):
