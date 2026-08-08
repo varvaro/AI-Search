@@ -1,17 +1,34 @@
 from __future__ import annotations
-import html, threading, time
+import base64, html, threading, time
 from pathlib import Path
 import streamlit as st
 import streamlit.components.v1 as components
 import ai_search
 import diagnostics
-from ai_search_config import APP_SUPPORT_DIR
-from ui_services import Settings, apply_filters, choose_folder, context_excerpt, display_location, ensure_runtime_layout, index_source, index_summary, indexed_root, load_settings, match_label, ollama_status, open_path, preview_document, read_history, save_settings, search_all, state_file
+from ai_search_config import APP_SUPPORT_DIR, QUERY_EXPANSION_MODE
+from ui_services import Settings, apply_filters, choose_folder, classify_query, context_excerpt, display_location, ensure_runtime_layout, index_source, index_summary, indexed_root, load_settings, match_label, match_reason, ollama_status, open_path, preview_document, read_history, save_settings, search_all, state_file
 
 ROOT=Path(__file__).resolve().parent; STATE=APP_SUPPORT_DIR; ensure_runtime_layout(STATE,ROOT/".ai-search-state"); SETTINGS=state_file(STATE,"settings.json"); PAGE_SIZE=8
 st.set_page_config(page_title="AI Search",page_icon="🔎",layout="wide")
+# Barevná paleta žije primárně v .streamlit/config.toml (theme.primaryColor atd. -
+# viz UI_AUDIT_AI_SEARCH_v1_1.md sekce 3.2). Tento blok drží jen strukturální
+# CSS, které Streamlit theming nepokrývá (karty výsledků/citací, zvýraznění,
+# stavové badge v sidebaru a u odpovědi AI).
 st.markdown("""<style>
-.stApp{max-width:1720px;margin:auto}.result{border:1px solid color-mix(in srgb,var(--text-color) 16%,transparent);background:var(--secondary-background-color);border-radius:10px;padding:.65rem .8rem;margin:.32rem 0}.result-title{font-weight:700;font-size:1rem}.meta{font-size:.8rem;opacity:.75;line-height:1.35}.context{font-size:.9rem;line-height:1.38;margin:.35rem 0}.citation{border-left:4px solid #3b82f6;background:var(--secondary-background-color);padding:.65rem .8rem;margin:.4rem 0;border-radius:0 8px 8px 0}mark{background:#fde68a;color:#111827;border-radius:3px;padding:0 2px}.wizard{display:flex;gap:.7rem;align-items:center;justify-content:center;margin:2rem 0;flex-wrap:wrap}.step{background:var(--secondary-background-color);border-radius:12px;padding:1rem 1.4rem;text-align:center;min-width:170px}.arrow{font-size:1.5rem;opacity:.55}@media(max-width:760px){.wizard{display:block}.step{margin:.5rem 0}.arrow{transform:rotate(90deg);text-align:center}.result{padding:.55rem}}
+.stApp{max-width:1720px;margin:auto}
+.result{border:1px solid color-mix(in srgb,var(--text-color) 16%,transparent);background:var(--secondary-background-color);border-radius:10px;padding:.65rem .8rem;margin:.32rem 0}
+.result-title{font-weight:700;font-size:1rem}
+.meta{font-size:.8rem;opacity:.75;line-height:1.35}
+.context{font-size:.9rem;line-height:1.38;margin:.35rem 0}
+.citation{border-left:4px solid #2563EB;background:var(--secondary-background-color);padding:.65rem .8rem;margin:.4rem 0 .2rem 0;border-radius:0 8px 8px 0}
+mark{background:#fde68a;color:#111827;border-radius:3px;padding:0 2px}
+.status-line{font-size:.92rem;line-height:1.7;margin:.1rem 0}
+.badge{display:inline-block;padding:.15rem .65rem;border-radius:999px;font-size:.8rem;font-weight:600;white-space:nowrap}
+.badge-green{background:#DCFCE7;color:#14532D}
+.badge-yellow{background:#FEF3C7;color:#78350F}
+.badge-red{background:#FEE2E2;color:#7F1D1D}
+.badge-blue{background:#DBEAFE;color:#1E3A8A}
+@media(max-width:760px){.result{padding:.55rem}}
 </style>""",unsafe_allow_html=True)
 
 @st.cache_resource(show_spinner="Načítám významové vyhledávání…")
@@ -37,19 +54,60 @@ def render_preview(row,query):
     project,folder=display_location(row,settings); st.subheader("Náhled")
     st.markdown(f"**{row.get('title',row['document'])}**"); st.caption(f"📁 {project} · 📂 {folder}")
     preview=preview_document(Path(row["path"]),context_excerpt(row.get("quote",""),query))
-    if preview["kind"]=="pdf": components.html(f'<iframe src="data:application/pdf;base64,{preview["content"]}" width="100%" height="620" style="border:0;border-radius:8px"></iframe>',height=630)
+    if preview["kind"]=="image":
+        st.image(base64.b64decode(preview["content"]),caption="Náhled 1. strany (vyrenderováno lokálně)",use_container_width=True)
+        st.download_button("💾 Stáhnout PDF",Path(row["path"]).read_bytes(),file_name=Path(row["path"]).name,mime="application/pdf",key="preview-download")
+    elif preview["kind"]=="pdf":
+        st.info("📄 PDF náhled se nepodařilo vyrenderovat. Otevřete soubor přímo, nebo si ho stáhněte.")
+        pdf_data=base64.b64decode(preview["content"])
+        st.download_button("💾 Stáhnout PDF",pdf_data,file_name=Path(row["path"]).name,mime="application/pdf",key="preview-download")
     elif preview["kind"]=="error": st.error(preview["content"])
     else: st.markdown(highlight(preview["content"][:6000],query),unsafe_allow_html=True)
     if st.button("📄 Otevřít dokument",key="preview-open"): st.toast(open_path(Path(row["path"]))[1])
 
+def relevance_meta_html(row,best):
+    """⭐-hodnocení shody + lidsky čitelný důvod (ui_services.match_label/
+    match_reason), sdíleno mezi výsledky vyhledávání a citacemi AI odpovědi -
+    dřív byl tento signál vidět jen u prvních, teď je konzistentní na obou
+    místech (viz UI_AUDIT_AI_SEARCH_v1_1.md, sekce 2D). Vykreslení je oproti
+    předchozí verzi render_result o jeden řádek kompaktnější (důvod na stejném
+    řádku jako hodnocení, ne pod ním) - žádný test na přesný HTML string necílí."""
+    relevance=match_label(row.get("score",0),best) if best else ""
+    if not relevance: return ""
+    reason=match_reason(row); reason_html=f" · {html.escape(reason)}" if reason else ""
+    return f"<br>⭐ {relevance}{reason_html}"
+
 def render_result(row,query,key,best):
-    project,folder=display_location(row,settings); context=context_excerpt(row.get("quote",""),query); relevance=match_label(row["score"],best)
-    st.markdown(f"<div class='result'><div class='result-title'>📄 {html.escape(row.get('title',row['document']))}</div><div class='meta'>📁 {html.escape(project)} &nbsp;·&nbsp; 📂 {html.escape(folder)} &nbsp;·&nbsp; 📅 {html.escape(row.get('date','—'))}<br>⭐ {relevance}</div><div class='context'>📝 {highlight(context,query)}</div></div>",unsafe_allow_html=True)
+    project,folder=display_location(row,settings); context=context_excerpt(row.get("quote",""),query)
+    st.markdown(f"<div class='result'><div class='result-title'>📄 {html.escape(row.get('title',row['document']))}</div><div class='meta'>📁 {html.escape(project)} &nbsp;·&nbsp; 📂 {html.escape(folder)} &nbsp;·&nbsp; 📅 {html.escape(row.get('date','—'))}{relevance_meta_html(row,best)}</div><div class='context'>📝 {highlight(context,query)}</div></div>",unsafe_allow_html=True)
     a,b,c=st.columns(3)
     if a.button("Náhled",key=f"preview-{key}",use_container_width=True): st.session_state.preview=row; st.rerun()
     if b.button("📄 Otevřít dokument",key=f"open-{key}",use_container_width=True): st.toast(open_path(Path(row["path"]))[1])
     if c.button("📂 Finder",key=f"finder-{key}",use_container_width=True): st.toast(open_path(Path(row["path"]),True)[1])
     with st.expander("Zobrazit úplnou cestu"): st.code(row["path"])
+
+def confidence_badge_html(level):
+    """Barevný badge pro ai_search.answer()'s `confidence` (green/yellow/red) -
+    pole už backend počítá a vrací, dosud ho ale UI nikde nečetlo (bylo vidět
+    jen jako text zaflákaný na konci odpovědi). Čistě čtení existujícího pole,
+    ai_search.py se nemění. `CONFIDENCE_LABELS` je existující veřejná konstanta
+    modulu ai_search, ne nová závislost."""
+    label=ai_search.CONFIDENCE_LABELS.get(level)
+    return f"<span class='badge badge-{level}'>{label}</span>" if label else ""
+
+def strip_confidence_footer(text):
+    """Backend (ai_search.answer) připojuje na konec odpovědi lidsky čitelný
+    blok o jistotě odpovědi ("\\n\\nJistota odpovědi:\\n..."). UI teď tutéž
+    informaci zobrazuje jako badge nad odpovědí, takže tento blok při
+    zobrazení odřezáváme, aby se nezobrazoval dvakrát. Čistě textová úprava
+    zobrazení v app.py - ai_search.py se nemění a formát návratové hodnoty
+    zůstává stejný. Pokud by backend formát bloku v budoucnu změnil, tento
+    řez se bezpečně stane no-opem (oddělovač se nenajde, text se zobrazí
+    celý) - nejde tedy o tvrdou vazbu, která by mohla něco rozbít."""
+    return text.split("\n\nJistota odpovědi:")[0]
+
+def sources_caption(count):
+    return f"Odpověď vychází z {count} zdroje" if count==1 else f"Odpověď vychází ze {count} zdrojů"
 
 settings=load_settings(SETTINGS); summary=index_summary(STATE)
 if not settings.project_root: settings.project_root=indexed_root(STATE)
@@ -59,12 +117,16 @@ if "index_message" in st.session_state: st.toast(st.session_state.pop("index_mes
 with st.sidebar:
     st.title("🔎 AI Search"); st.caption("Lokální hledání v projektových dokumentech")
     select_folder("projekt",settings.project_root,"project_root")
-    st.divider(); st.markdown("#### Přehled systému")
-    a,b=st.columns(2); a.metric("PDF",summary["pdf"]); b.metric("E-maily",summary["emails"])
-    a,b=st.columns(2); a.metric("Poznámky",summary["notes"]); b.metric("Dokumenty",summary["total"])
-    st.caption(f"Velikost indexu: {summary['size_bytes']/1024/1024:.1f} MB")
-    st.caption(f"Synchronizace: {summary['latest']}"); st.caption(f"Embedding: {ai_search.EMBEDDING_MODEL}"); st.caption(f"LLM: {settings.default_llm}")
-    st.write("Ollama", "🟢 Běží" if ollama_status() else "🔴 Není dostupná")
+    st.divider()
+    # Zjednodušený přehled systému (UI_AUDIT_AI_SEARCH_v1_1.md, sekce 2A/4-UI1):
+    # název embedding/LLM modelu, velikost v MB a rozpad PDF/e-mail/poznámky
+    # patří jen do Diagnostiky - zde je vidí uživatel na každém hledání, i když
+    # to k práci nepotřebuje. Data samotná (index_summary) se nemění, mění se
+    # jen to, co z nich sidebar vykresluje.
+    index_ready=summary["ready"]; ollama_ok=ollama_status()
+    st.markdown(f"<div class='status-line'>{'🟢' if index_ready else '🔴'} <b>{'Index připraven' if index_ready else 'Index není připraven'}</b>"+(f" · {summary['total']} dokumentů" if index_ready else "")+"</div>",unsafe_allow_html=True)
+    if index_ready: st.caption(f"Aktualizováno: {summary['latest']}")
+    st.markdown(f"<div class='status-line'>{'🟢' if ollama_ok else '🔴'} Ollama {'běží' if ollama_ok else 'není dostupná'}</div>",unsafe_allow_html=True)
     job=st.session_state.get("index_job"); running=bool(job and job["thread"].is_alive())
     if st.button("Aktualizovat index",type="primary",use_container_width=True,disabled=not bool(settings.project_root) or running):
         root=Path(settings.project_root)
@@ -132,9 +194,22 @@ elif st.session_state.page=="history":
     if st.button("Zpět k hledání"): st.session_state.page="search"; st.rerun()
 else:
     if not summary["ready"]:
-        st.header("Začněte ve třech krocích"); st.markdown("<div class='wizard'><div class='step'><b>1. Vyber projekt</b><br>Pomocí Finderu</div><div class='arrow'>→</div><div class='step'><b>2. Vytvoř index</b><br>Jedním tlačítkem</div><div class='arrow'>→</div><div class='step'><b>3. Začni hledat</b><br>Dokumenty i odpovědi</div></div>",unsafe_allow_html=True)
+        st.header("Začněte ve třech krocích")
+        # Nativní st.columns/st.container(border=True) namísto vlastních CSS
+        # tříd .wizard/.step/.arrow - stejný obsah, méně ad-hoc CSS k údržbě.
+        steps=[("1. Vyberte projekt","Pomocí Finderu vlevo v panelu"),("2. Vytvořte index","Jedním tlačítkem v postranním panelu"),("3. Začněte hledat","Dokumenty i AI odpovědi")]
+        cols=st.columns([3,.4,3,.4,3])
+        for i,(title,detail) in enumerate(steps):
+            with cols[i*2].container(border=True): st.markdown(f"**{title}**"); st.caption(detail)
+            if i<2: cols[i*2+1].markdown("<div style='text-align:center;padding-top:2.2rem;opacity:.4;font-size:1.4rem'>→</div>",unsafe_allow_html=True)
     st.header("Najděte informace ve svých projektech")
-    mode=st.radio("Režim",["Hledat dokumenty","Položit otázku"],horizontal=True,label_visibility="collapsed"); query=st.text_input("Hledaný výraz nebo otázka",placeholder="Například: Kdy má být dokončena hydroizolace?"); deep=st.toggle("Hloubková analýza",False,disabled=mode!="Položit otázku")
+    query=st.text_input("Hledaný výraz nebo otázka",placeholder="Například: Kdy má být dokončena hydroizolace?",key="search_query")
+    classification=classify_query(query) if query else {"mode":"dokument","deep":False}
+    mode="Položit otázku" if classification["mode"]=="otazka" else "Hledat dokumenty"
+    force_deep=st.toggle("Vynutit hloubkovou analýzu",False,help="U komplexních dotazů (požadavky, kontrola, porovnání, shrnutí, rizika) se zapíná automaticky."); deep=classification["deep"] or force_deep
+    if query:
+        mode_icon="🧠" if mode=="Položit otázku" else "🔤"
+        st.markdown(f"<span class='badge badge-blue'>{mode_icon} {mode}</span>"+(" <span class='badge badge-blue'>🧠 hloubková analýza</span>" if deep else ""),unsafe_allow_html=True)
     with st.expander("Filtry"):
         c1,c2,c3=st.columns(3); source=c1.selectbox("Zdroj",["Vše","Dokument","E-mail","Poznámka"]); project_filter=c2.text_input("Projekt"); folder=c3.text_input("Podsložka"); c4,c5,c6=st.columns(3); extension=c4.text_input("Typ souboru"); author=c5.text_input("Autor nebo odesílatel"); date_range=c6.date_input("Datum od–do",value=[])
         if st.button("Zrušit filtry"): st.rerun()
@@ -142,10 +217,13 @@ else:
         if st.session_state.get("last_query")!=query: st.session_state.visible_results=PAGE_SIZE; st.session_state.last_query=query
         started=time.perf_counter()
         with st.spinner("Hledám v dostupných zdrojích…"):
-            rows=search_all(query,settings,STATE,embeddings()); start=date_range[0] if len(date_range)>0 else None; end=date_range[-1] if len(date_range)>1 else None; rows=apply_filters(rows,source,"Vše" if not project_filter else project_filter,folder,"Vše" if not extension else extension,author,start,end)
+            rows=search_all(query,settings,STATE,embeddings(),is_question=classification["mode"]=="otazka",expand_query=QUERY_EXPANSION_MODE); start=date_range[0] if len(date_range)>0 else None; end=date_range[-1] if len(date_range)>1 else None; rows=apply_filters(rows,source,"Vše" if not project_filter else project_filter,folder,"Vše" if not extension else extension,author,start,end)
         elapsed=time.perf_counter()-started; search_mode="AI odpověď" if mode=="Položit otázku" else "Hybrid (fulltext + význam)"
         st.caption(f"Nalezeno: {len(rows)} dokumentů · čas {elapsed:.2f} s · režim {search_mode}")
-        if not rows: st.warning("Nebyly nalezeny žádné odpovídající výsledky.")
+        if not rows:
+            with st.container(border=True):
+                st.warning("Nebyly nalezeny žádné odpovídající výsledky.")
+                st.caption("Zkuste upravit klíčová slova, zkontrolovat aktivní filtry, nebo ověřit, že je projekt zaindexovaný.")
         elif mode=="Položit otázku":
             original_default,original_complex=ai_search.DEFAULT_MODEL,ai_search.COMPLEX_MODEL
             try:
@@ -155,10 +233,18 @@ else:
                 ai_search.DEFAULT_MODEL,ai_search.COMPLEX_MODEL=original_default,original_complex
             if not response.get("citations"): st.warning("V dostupných zdrojích jsem nenašel dostatek informací pro spolehlivou odpověď.")
             else:
-                st.subheader("Odpověď"); st.write(response["answer"]); st.subheader("Citace")
-                for i,row in enumerate(response["citations"],1):
-                    project,_=display_location(row,settings); st.markdown(f"<div class='citation'><b>[{i}] {html.escape(row['document'])}</b><br>📁 {html.escape(project)}<br>📝 {highlight(context_excerpt(row.get('quote',''),query),query)}</div>",unsafe_allow_html=True)
-                    if st.button("Přejít na citovaný dokument",key=f"citation-{i}"): st.toast(open_path(Path(row["path"]))[1])
+                citations=response["citations"]
+                with st.container(border=True):
+                    head_l,head_r=st.columns([5,2]); head_l.subheader("Odpověď")
+                    badge=confidence_badge_html(response.get("confidence"))
+                    if badge: head_r.markdown(f"<div style='text-align:right;padding-top:.5rem'>{badge}</div>",unsafe_allow_html=True)
+                    st.write(strip_confidence_footer(response["answer"]))
+                    st.caption(sources_caption(len(citations)))
+                st.subheader(f"Zdroje ({len(citations)})")
+                best_citation_score=max((row.get("score",0) for row in citations),default=0)
+                for i,row in enumerate(citations,1):
+                    project,_=display_location(row,settings); st.markdown(f"<div class='citation'><b>[{i}] {html.escape(row['document'])}</b><br>📁 {html.escape(project)}{relevance_meta_html(row,best_citation_score)}<br>📝 {highlight(context_excerpt(row.get('quote',''),query),query)}</div>",unsafe_allow_html=True)
+                    if st.button("Přejít na citovaný dokument",key=f"citation-{i}",use_container_width=True): st.toast(open_path(Path(row["path"]))[1])
         else:
             left,right=st.columns([3,2],gap="large"); visible=rows[:st.session_state.visible_results]; best=max(row["score"] for row in rows)
             with left:
@@ -167,6 +253,10 @@ else:
                 if len(visible)<len(rows) and st.button("Zobrazit další výsledky",use_container_width=True): st.session_state.visible_results+=PAGE_SIZE; st.rerun()
             with right:
                 if st.session_state.get("preview"): render_preview(st.session_state.preview,query)
-                else: st.info("Klikněte na Náhled u výsledku. Zde se zobrazí dokument nebo relevantní text.")
+                else:
+                    with st.container(border=True): st.info("Klikněte na Náhled u výsledku. Zde se zobrazí dokument nebo relevantní text.")
     elif query: st.info("Nejprve vyberte projekt a vytvořte index.")
-    else: st.info("Zadejte hledaný výraz nebo otázku. Vše zůstává pouze na tomto Macu.")
+    else:
+        with st.container(border=True):
+            st.markdown("🔎 **Zadejte hledaný výraz nebo otázku.** Vše zůstává pouze na tomto Macu.")
+            st.caption("Například: „Kdy má být dokončena hydroizolace?“ nebo „změnový list GD“")

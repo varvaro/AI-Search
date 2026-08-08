@@ -210,10 +210,25 @@ def test_no_results_screen(tmp_path,monkeypatch):
     app=AppTest.from_file("app.py",default_timeout=10).run(); app.text_input[0].input("nenalezitelný výraz").run()
     assert not app.exception and any("Nebyly nalezeny" in warning.value for warning in app.warning)
 
+def test_ui_search_uses_the_configured_query_expansion_branch(tmp_path,monkeypatch):
+    """app.py must hand search_all the branch configured in ai_search_config,
+    not the function default. Which branch runs is a real behavioural choice:
+    measured 2026-08-08 on the 20-query regression suite, the "fts" branch
+    gained recall with zero regressions while enabling the vector branch too
+    cost 4 cases (it replaces the embedded query text instead of adding to it)."""
+    import ai_search_config
+    seen={}
+    _mock_ready_ui(monkeypatch,tmp_path,[])
+    monkeypatch.setattr(ui,"search_all",lambda *a,**k:(seen.update(k),[])[1])
+    app=AppTest.from_file("app.py",default_timeout=10).run(); app.text_input[0].input("Pentaflex").run()
+    assert not app.exception
+    assert ai_search_config.QUERY_EXPANSION_MODE=="fts"
+    assert seen.get("expand_query")==ai_search_config.QUERY_EXPANSION_MODE
+
 def test_ai_citations_render_as_blocks(tmp_path,monkeypatch):
     path=tmp_path/"citovaný dokument.pdf"; path.write_bytes(b"pdf")
     row={"document":path.name,"title":path.name,"path":str(path),"project":"Projekt","quote":"Citovaný kontext dokumentu s dostatečnou délkou. "+("Další věta. "*12),"score":1.0,"source":"Dokument","date":"2026-08-04","extension":"pdf","author":""}
     _mock_ready_ui(monkeypatch,tmp_path,[row]); monkeypatch.setattr(ai_search,"answer",lambda *a,**k:{"answer":"Ověřená odpověď [1].","citations":[row]})
-    app=AppTest.from_file("app.py",default_timeout=10).run(); app.radio[0].set_value("Položit otázku").run(); app.text_input[0].input("Jaký je závěr?").run()
+    app=AppTest.from_file("app.py",default_timeout=10).run(); app.text_input[0].input("Jaký je závěr?").run()
     assert not app.exception and any("Odpověď" in h.value for h in app.subheader)
     assert any(b.label=="Přejít na citovaný dokument" for b in app.button)

@@ -1,0 +1,7 @@
+# Barevná paleta AI Search UI v1.1 (viz UI_AUDIT_AI_SEARCH_v1_1.md, sekce 3.2).
+# Čistě vizuální nastavení - neovlivňuje retrieval, indexaci ani API kontrakty.
+[theme]
+primaryColor = "#2563EB"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F5F7FA"
+textColor = "#1B2333"
