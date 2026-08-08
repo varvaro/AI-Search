@@ -3,7 +3,7 @@
 Rozsah: pouze document_extractors.py + ai_search.extract() dispatch.
 Nezasahuje do chunks(), retrievalu, embeddingu, LanceDB, RRF ani scoringu.
 """
-import subprocess
+import shutil
 import zipfile
 from email.message import EmailMessage
 from pathlib import Path
@@ -103,11 +103,15 @@ RTF_WITH_EMBEDDED_BINARY = (
     r"}"
 )
 
+TEXTUTIL_AVAILABLE = shutil.which("/usr/bin/textutil") is not None
 
-@pytest.mark.skipif(
-    subprocess.run(["/usr/bin/textutil", "-help"], capture_output=True).returncode not in (0, 1),
+requires_textutil = pytest.mark.skipif(
+    not TEXTUTIL_AVAILABLE,
     reason="textutil není dostupný (vyžaduje macOS)",
 )
+
+
+@requires_textutil
 def test_rtf_extraction_uses_textutil_and_strips_binary_payload(tmp_path):
     path = tmp_path / "predpis.rtf"
     path.write_text(RTF_WITH_EMBEDDED_BINARY, encoding="utf-8")
@@ -120,6 +124,7 @@ def test_rtf_extraction_uses_textutil_and_strips_binary_payload(tmp_path):
     assert len(text) < path.stat().st_size / 10
 
 
+@requires_textutil
 def test_rtf_no_longer_uses_raw_path_read_text(tmp_path, monkeypatch):
     """Zajišťuje, že se .rtf nedostane do větve syrového path.read_text()."""
     path = tmp_path / "x.rtf"
