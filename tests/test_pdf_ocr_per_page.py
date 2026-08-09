@@ -22,6 +22,7 @@ mix of:
 """
 from __future__ import annotations
 
+import shutil
 import subprocess
 import threading
 import time
@@ -36,6 +37,34 @@ from reportlab.pdfgen import canvas as _canvas  # noqa: E402
 from reportlab.lib.pagesizes import A4  # noqa: E402
 PIL_IMAGE = pytest.importorskip("PIL.Image")
 from PIL import Image, ImageDraw, ImageFont  # noqa: E402
+
+PRODUCTION_TOOL_PATHS = {
+    "pdfinfo": "/opt/homebrew/bin/pdfinfo",
+    "pdftotext": "/opt/homebrew/bin/pdftotext",
+    "pdftoppm": "/opt/homebrew/bin/pdftoppm",
+    "tesseract": "/opt/homebrew/bin/tesseract",
+}
+
+
+def _require_tools(*tools):
+    missing = [tool for tool in tools if shutil.which(PRODUCTION_TOOL_PATHS[tool]) is None]
+    if missing:
+        pytest.skip("missing required PDF/OCR tools: " + ", ".join(missing))
+
+
+@pytest.fixture
+def portable_private_tmp(monkeypatch, tmp_path):
+    """Keep mocked OCR unit tests active where macOS /private/tmp is absent."""
+    if Path("/private/tmp").is_dir():
+        return
+    original = ai_search.tempfile.TemporaryDirectory
+
+    def temporary_directory(*args, **kwargs):
+        if kwargs.get("dir") == "/private/tmp":
+            kwargs["dir"] = str(tmp_path)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(ai_search.tempfile, "TemporaryDirectory", temporary_directory)
 
 
 def _font(size):
@@ -91,6 +120,7 @@ def _leftover_ocr_tempdirs():
 # A) native text layer -> no OCR at all
 # ---------------------------------------------------------------------------
 def test_a_native_text_pdf_skips_ocr_entirely(tmp_path, monkeypatch):
+    _require_tools("pdfinfo", "pdftotext")
     pdf = _make_native_text_pdf(tmp_path, ["NATIVNI TEXTOVA VRSTVA PRVNI RADEK", "DRUHY RADEK DOPLNUJE DELKU NAD OSMDESAT ZNAKU CELKEM"])
     def fail_if_called(cmd, timeout): raise AssertionError("OCR subprocess must not run for a native-text PDF: "+str(cmd))
     monkeypatch.setattr(ai_search, "_run_ocr_subprocess", fail_if_called)
@@ -102,6 +132,7 @@ def test_a_native_text_pdf_skips_ocr_entirely(tmp_path, monkeypatch):
 # B) small image-only PDF -> real per-page OCR
 # ---------------------------------------------------------------------------
 def test_b_small_image_only_pdf_uses_real_per_page_ocr(tmp_path):
+    _require_tools("pdfinfo", "pdftotext", "pdftoppm", "tesseract")
     pdf = _make_image_only_pdf(tmp_path, ["JEDNA STRANKA OCR TEST"])
     text = ai_search.extract_pdf(pdf)
     assert "JEDNA" in text.upper() and "STRANKA" in text.upper()
@@ -112,6 +143,7 @@ def test_b_small_image_only_pdf_uses_real_per_page_ocr(tmp_path):
 # C) multi-page OCR PDF -> correct page order, real tesseract/pdftoppm
 # ---------------------------------------------------------------------------
 def test_c_multi_page_ocr_preserves_page_order_real_subprocesses(tmp_path):
+    _require_tools("pdfinfo", "pdftotext", "pdftoppm", "tesseract")
     before = _leftover_ocr_tempdirs()
     pdf = _make_image_only_pdf(tmp_path, ["PRVNI STRANKA ALFA", "DRUHA STRANKA BETA", "TRETI STRANKA GAMA"])
     text = ai_search.extract_pdf(pdf)
@@ -129,7 +161,7 @@ def test_c_multi_page_ocr_preserves_page_order_real_subprocesses(tmp_path):
 # ---------------------------------------------------------------------------
 # D) page render timeout skips only that page, others still succeed
 # ---------------------------------------------------------------------------
-def test_d_one_page_render_timeout_skips_only_that_page(tmp_path, monkeypatch):
+def test_d_one_page_render_timeout_skips_only_that_page(tmp_path, monkeypatch, portable_private_tmp):
     pdf = tmp_path / "scan.pdf"; pdf.write_bytes(b"%PDF-fake")
     monkeypatch.setattr(ai_search, "_pdf_page_count", lambda path, timeout=10: 3)
     monkeypatch.setattr(ai_search.subprocess, "run", lambda *a, **k: type("R", (), {"stdout": ""})())
@@ -153,7 +185,7 @@ def test_d_one_page_render_timeout_skips_only_that_page(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 # E) Tesseract timeout of one page skips only that page
 # ---------------------------------------------------------------------------
-def test_e_one_page_tesseract_timeout_skips_only_that_page(tmp_path, monkeypatch):
+def test_e_one_page_tesseract_timeout_skips_only_that_page(tmp_path, monkeypatch, portable_private_tmp):
     pdf = tmp_path / "scan.pdf"; pdf.write_bytes(b"%PDF-fake")
     monkeypatch.setattr(ai_search, "_pdf_page_count", lambda path, timeout=10: 3)
     monkeypatch.setattr(ai_search.subprocess, "run", lambda *a, **k: type("R", (), {"stdout": ""})())
@@ -180,6 +212,7 @@ def test_e_one_page_tesseract_timeout_skips_only_that_page(tmp_path, monkeypatch
 # F) temp files cleaned up after a fully successful extraction
 # ---------------------------------------------------------------------------
 def test_f_temp_files_cleaned_up_after_success(tmp_path):
+    _require_tools("pdfinfo", "pdftotext", "pdftoppm", "tesseract")
     before = _leftover_ocr_tempdirs()
     pdf = _make_image_only_pdf(tmp_path, ["USPESNY TEST STRANKY"])
     ai_search.extract_pdf(pdf)
@@ -189,7 +222,7 @@ def test_f_temp_files_cleaned_up_after_success(tmp_path):
 # ---------------------------------------------------------------------------
 # G) temp files cleaned up after the document-level budget is exceeded
 # ---------------------------------------------------------------------------
-def test_g_temp_files_cleaned_up_after_document_budget_exceeded(tmp_path, monkeypatch):
+def test_g_temp_files_cleaned_up_after_document_budget_exceeded(tmp_path, monkeypatch, portable_private_tmp):
     before = _leftover_ocr_tempdirs()
     pdf = tmp_path / "scan.pdf"; pdf.write_bytes(b"%PDF-fake")
     monkeypatch.setattr(ai_search, "_pdf_page_count", lambda path, timeout=10: 5)
@@ -214,7 +247,7 @@ def test_g_temp_files_cleaned_up_after_document_budget_exceeded(tmp_path, monkey
 # ---------------------------------------------------------------------------
 # H) temp files cleaned up after an unhandled exception (all pages fail)
 # ---------------------------------------------------------------------------
-def test_h_temp_files_cleaned_up_after_all_pages_fail(tmp_path, monkeypatch):
+def test_h_temp_files_cleaned_up_after_all_pages_fail(tmp_path, monkeypatch, portable_private_tmp):
     before = _leftover_ocr_tempdirs()
     pdf = tmp_path / "scan.pdf"; pdf.write_bytes(b"%PDF-fake")
     monkeypatch.setattr(ai_search, "_pdf_page_count", lambda path, timeout=10: 2)
@@ -234,6 +267,7 @@ def test_h_temp_files_cleaned_up_after_all_pages_fail(tmp_path, monkeypatch):
 #        pdftoppm/tesseract processes, no hang.
 # ---------------------------------------------------------------------------
 def test_ijk_stop_during_real_pdf_ocr_kills_child_with_no_orphans(tmp_path):
+    _require_tools("pdfinfo", "pdftotext", "pdftoppm", "tesseract")
     pdf = _make_image_only_pdf(tmp_path, [f"STRANKA CISLO {i}" for i in range(8)])
     watchdog = ai_search.ParsingWatchdog()
     stop = threading.Event()
@@ -278,6 +312,7 @@ def test_document_budget_floor_exceeds_worst_case_single_page_allowance():
 
 
 def test_pdf_page_count_valid_and_invalid(tmp_path):
+    _require_tools("pdfinfo")
     pdf = _make_image_only_pdf(tmp_path, ["A", "B", "C"])
     assert ai_search._pdf_page_count(pdf) == 3
     broken = tmp_path / "broken.pdf"; broken.write_bytes(b"not a real pdf")
@@ -292,7 +327,7 @@ def test_pdf_page_count_valid_and_invalid(tmp_path):
 # test itself runs in well under a second while still exercising the real
 # extract_pdf()/_extract_pdf_per_page() deadline arithmetic and page loop.
 # ---------------------------------------------------------------------------
-def test_large_pdf_completes_beyond_old_60s_single_call_cap(tmp_path, monkeypatch):
+def test_large_pdf_completes_beyond_old_60s_single_call_cap(tmp_path, monkeypatch, portable_private_tmp):
     pdf = tmp_path / "big_scan.pdf"; pdf.write_bytes(b"%PDF-fake")
     page_count = 15
     per_page_seconds = 5.0  # 15 * 5s = 75s total > old hard-coded 60s pdftoppm cap
