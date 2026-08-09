@@ -290,3 +290,139 @@ def test_search_all_defaults_to_no_expansion(monkeypatch, tmp_path):
     db.write_bytes(b"")
     ui.search_all("betonáž", settings, state_dir, RecordingEmbeddings())
     assert captured["expand_query"] is False
+
+
+# ---------------------------------------------------------------------------
+# 6. ABBREVIATION_FILENAME_MATCH_BONUS (2026-08-09 rr-kzp-monolit-feri-01 fix)
+#
+# `ai_search._abbreviation_filename_needles()` is a pure helper (no I/O, no
+# search() call needed) - see its docstring in ai_search.py - so the "which
+# category can trigger the bonus" contract is tested directly against it
+# first, and only the ranking OUTCOME is tested end-to-end via search().
+# ---------------------------------------------------------------------------
+
+def test_abbreviation_filename_needles_none_without_expansion():
+    """Requirement: 'bez expansion se bonus nikdy nepoužije'. expand_query=False
+    makes search() pass expansion=None into this helper - see search()'s own
+    `expansion = query_expansion.expand_query(query) if (...) else None`."""
+    assert ai_search._abbreviation_filename_needles(None) == set()
+
+
+def test_abbreviation_filename_needles_extracts_only_the_abbreviations_category():
+    """'kontrolní a zkušební plán' matches the 'kzp' rule via its synonym
+    trigger; that rule carries an 'abbreviations' term ("KZP") AND
+    'documents' terms ("kontrolní bod", "zkušební plán", "plán kontrol").
+    Only "kzp" (casefolded) may end up in the needle set - never the looser
+    categories, even though they are present in the SAME
+    matched_rules[i]["terms"] list expand_query() returns."""
+    expansion = qe.expand_query("kontrolní a zkušební plán")
+    assert any(rule["key"] == "kzp" for rule in expansion.matched_rules)
+    assert ai_search._abbreviation_filename_needles(expansion) == {"kzp"}
+
+
+def test_abbreviation_filename_needles_drops_abbreviations_shorter_than_the_minimum():
+    """2026-08-09 regression fix: "TP" and "ZL" are 2-char abbreviations that
+    double as this corpus's own filename numbering convention ("TP 2.4 - ...",
+    "ZL č.001 - ..."), so they false-positive-matched dozens of unrelated
+    documents - see ABBREVIATION_FILENAME_MIN_LENGTH's comment. Both must be
+    dropped, while the 3-char "KZP" (the case this bonus exists for) is kept."""
+    assert len("TP") < ai_search.ABBREVIATION_FILENAME_MIN_LENGTH
+    assert len("ZL") < ai_search.ABBREVIATION_FILENAME_MIN_LENGTH
+    assert len("KZP") >= ai_search.ABBREVIATION_FILENAME_MIN_LENGTH
+    tp_expansion = qe.expand_query("technologický postup")
+    zl_expansion = qe.expand_query("změnový list")
+    assert any(rule["key"] == "tp" for rule in tp_expansion.matched_rules)
+    assert any(rule["key"] == "změnový list" for rule in zl_expansion.matched_rules)
+    assert ai_search._abbreviation_filename_needles(tp_expansion) == set()
+    assert ai_search._abbreviation_filename_needles(zl_expansion) == set()
+
+
+def test_abbreviation_filename_needles_empty_for_a_rule_without_an_abbreviation():
+    """'betonáž' matches its own rule (key trigger), which has NO
+    'abbreviations' category at all - only 'synonyms'/'documents'. The needle
+    set must stay empty even though the rule DID match and DID contribute
+    terms - proves synonym/document terms can never leak into the filename
+    bonus, independent of any implementation-detail filtering."""
+    expansion = qe.expand_query("betonáž")
+    assert expansion.matched_rules, "sanity: the rule must actually have fired"
+    assert "abbreviations" not in qe.DOMAIN_VOCABULARY["betonáž"]
+    assert ai_search._abbreviation_filename_needles(expansion) == set()
+
+
+@pytest.fixture
+def kzp_index(tmp_path):
+    """Three documents isolating ABBREVIATION_FILENAME_MATCH_BONUS from the
+    general FILENAME_MATCH_BONUS: none of their names contain the query
+    verbatim (so `filename_match` never fires), and none of their bodies
+    contain "kontrolní"/"zkušební"/"plán" (so a baseline, non-expanded query
+    cannot find them lexically either - mirrors the real rr-kzp-monolit-feri-01
+    pattern of a document that ONLY ever spells the concept as "KZP").
+
+    - "KZP silny.txt" and "Bez zkratky.txt" share the SAME body WORDS (only
+      trailing punctuation differs, so sync()'s content-hash dedup does not
+      collapse them into one document, while RecordingEmbeddings - word-token
+      based, see its docstring above - still gives them the exact same
+      semantic_similarity) -> tied BM25/vector signal by construction; "KZP"
+      in the name is the only difference, isolating exactly what the bonus is
+      meant to reward.
+    - "KZP slaby.txt" also carries "KZP" in its name (same bonus-eligibility
+      as "KZP silny.txt") but unrelated body content, to prove the bonus
+      does not paper over a genuine relevance gap between two equally-
+      eligible documents (requirement 4)."""
+    root = tmp_path / "projekt"
+    root.mkdir()
+    shared_body = "Technologický postup zajištění stavební jámy mikrozápory"
+    docs = {
+        "KZP silny.txt": shared_body + " .",
+        "Bez zkratky.txt": shared_body + " !",
+        "KZP slaby.txt": "Nesouvisející text o fakturaci a platebních podmínkách.",
+    }
+    for name, body in docs.items():
+        (root / name).write_text(body, encoding="utf-8")
+    db = tmp_path / "index.sqlite3"
+    lance = tmp_path / "lance"
+    embeddings = RecordingEmbeddings()
+    ai_search.sync(root, db, lance, embeddings)
+    return db, lance, embeddings
+
+
+def test_abbreviation_filename_match_favours_the_document_naming_the_abbreviation(kzp_index):
+    """Requirement 1: with expand_query="fts", "KZP silny.txt" must outrank
+    its content-identical twin "Bez zkratky.txt" - the only difference
+    between them is the "KZP" abbreviation in the filename."""
+    db, lance, embeddings = kzp_index
+    query = "kontrolní a zkušební plán"
+    rows = ai_search.search(query, db, lance, embeddings, limit=10, expand_query="fts")
+    documents = [r["document"] for r in rows]
+    assert documents.index("KZP silny.txt") < documents.index("Bez zkratky.txt")
+
+
+def test_abbreviation_filename_match_requires_expansion_to_be_active(kzp_index):
+    """Requirement 2: with expand_query=False (default), "KZP silny.txt" gets
+    no help from its filename. Two documents with the same semantic_similarity
+    still get very slightly different scores from RRF rank-tie-breaking
+    (arbitrary iteration order, unrelated to this fix) - so the assertion is a
+    delta well below the 0.02 bonus, not exact equality, to avoid asserting
+    away that pre-existing tie-breaking noise."""
+    db, lance, embeddings = kzp_index
+    query = "kontrolní a zkušební plán"
+    rows = ai_search.search(query, db, lance, embeddings, limit=10, expand_query=False)
+    by_document = {r["document"]: r["score"] for r in rows}
+    delta = by_document["KZP silny.txt"] - by_document["Bez zkratky.txt"]
+    assert abs(delta) < ai_search.ABBREVIATION_FILENAME_MATCH_BONUS / 2, (
+        f"filename must grant no meaningful advantage when expand_query=False (delta={delta})"
+    )
+
+
+def test_two_documents_sharing_the_abbreviation_keep_their_relative_order(kzp_index):
+    """Requirement 4: "KZP silny.txt" and "KZP slaby.txt" both carry "KZP" in
+    their name and therefore both receive the SAME flat bonus - it must not
+    reorder them relative to each other. "KZP silny.txt" is already the more
+    relevant of the two by construction (shares no content with the unrelated
+    "KZP slaby.txt"), so it must stay ahead with or without expansion."""
+    db, lance, embeddings = kzp_index
+    query = "kontrolní a zkušební plán"
+    for expand_query in (False, "fts"):
+        rows = ai_search.search(query, db, lance, embeddings, limit=10, expand_query=expand_query)
+        documents = [r["document"] for r in rows]
+        assert documents.index("KZP silny.txt") < documents.index("KZP slaby.txt"), f"order changed for expand_query={expand_query!r}"

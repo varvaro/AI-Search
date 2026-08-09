@@ -926,6 +926,18 @@ QA_RETRIEVAL_POOL_SIZE = 500    # Phase 1 pool for question-style queries
 QA_RERANK_POOL_SIZE = 300       # Phase 2 pool for question-style queries
 SEMANTIC_RERANK_MULTIPLIER = 2.0  # semantic-rank RRF contribution vs. a single retrieval list
 FILENAME_MATCH_BONUS = 0.03     # exact query match in document name; > max single RRF contribution (1/60)
+# Weaker sibling of FILENAME_MATCH_BONUS, scoped ONLY to expand_query's
+# abbreviation-category terms (query_expansion.py's "abbreviations" list per
+# rule - never "synonyms"/"processes"/"documents"). Fixes the 2026-08-09
+# rr-kzp-monolit-feri-01 diagnostic: a spelled-out query ("kontrolní a
+# zkušební plán") never satisfies the full-string `needle` filename check
+# above even when the file itself is named with the acronym ("KZP monolit
+# Smíchov - formulář.xls"), because `needle` is the whole query, not its
+# individual tokens/expansion terms. Deliberately smaller than
+# FILENAME_MATCH_BONUS (weaker evidence - a 2-4 char acronym in a filename is
+# far less discriminative than the full query matching verbatim) but still
+# > 1/60 so it can override a pure RRF-rank tie the same way FILENAME_MATCH_BONUS does.
+ABBREVIATION_FILENAME_MATCH_BONUS = 0.02
 CHUNK_LENGTH_SHORT = 50         # chars; below this a chunk carries almost no standalone context
 CHUNK_LENGTH_MEDIUM = 150       # chars; below this the chunk is still fairly thin
 SHORT_CHUNK_PENALTY = 0.5
@@ -1080,6 +1092,41 @@ def _fts_query_terms(query, extra_terms=()):
         terms.append('"'+word+'"')
         if len(word)>=FTS_PREFIX_MIN_LENGTH: terms.append(word[:-FTS_PREFIX_STRIP]+"*")
     return " OR ".join(terms)
+
+# 2026-08-09 retrieval regression benchmark (rr-tp-strikane-betony-01,
+# rr-tp-odvodneni-watersystem-01, rr-zl-roznaseci-deska-01): the 2-char
+# abbreviations "TP" and "ZL" are also this corpus's own filename NUMBERING
+# CONVENTION ("TP 2.4 - ...", "ZL č.001 - ..."), so they match dozens of
+# unrelated documents' filenames and, amplified by search_all()'s multi-chunk
+# evidence aggregation, pushed the actually-relevant document out of the
+# top 10 for other, unrelated queries. Excluding needles shorter than this
+# closes that hole while keeping the target "KZP"/3-char+ abbreviations
+# (which did not reproduce the false-positive pattern in that same benchmark
+# run) eligible.
+ABBREVIATION_FILENAME_MIN_LENGTH = 3
+
+def _abbreviation_filename_needles(expansion: "query_expansion.QueryExpansion | None") -> set[str]:
+    """Casefolded abbreviation terms (query_expansion.py's "abbreviations"
+    category only - never "synonyms"/"processes"/"documents") that survived
+    THIS query's expand_query() budget, for ABBREVIATION_FILENAME_MATCH_BONUS.
+    Pure/side-effect-free so it can be unit-tested without a full search()
+    call - see tests/test_query_expansion.py.
+
+    Always empty when `expansion` is None, i.e. expand_query=False (the
+    default) or a query that matched no dictionary rule - the caller's bonus
+    is then unconditionally skipped, leaving scoring byte-for-byte identical
+    to before this function existed. Terms shorter than
+    ABBREVIATION_FILENAME_MIN_LENGTH are dropped - see its comment."""
+    if expansion is None:
+        return set()
+    needles: set[str] = set()
+    for rule in expansion.matched_rules:
+        vocab_abbreviations = query_expansion.DOMAIN_VOCABULARY.get(rule["key"], {}).get("abbreviations", ())
+        needles.update(
+            term.casefold() for term in rule["terms"]
+            if term in vocab_abbreviations and len(term) >= ABBREVIATION_FILENAME_MIN_LENGTH
+        )
+    return needles
 
 class SearchTrace:
     """Optional instrumentation sink for search(). Pass an instance as
@@ -1357,6 +1404,7 @@ def search(query, db_path, lance_dir, embeddings, limit=8, is_question=False, tr
     # Přesná shoda dotazu v názvu dokumentu je silnější důkaz než
     # sémantická podobnost obecného textu dodacího listu.
     needle=query.casefold().strip(); fts_id_set=set(fts_ids); vector_id_set=set(vector_ids)
+    abbreviation_needles=_abbreviation_filename_needles(expansion)
     # Fetched as a separate pass (not interleaved with scoring like before)
     # because candidate_strategy="union_ce" needs every candidate's full chunk
     # text collected up front for ONE batched cross-encoder call - a per-
@@ -1396,12 +1444,17 @@ def search(query, db_path, lance_dir, embeddings, limit=8, is_question=False, tr
         row=rows_by_id.get(cid)
         if not row: continue
         filename_match=bool(needle) and needle in row[0].casefold(); fts_hit=cid in fts_id_set
-        quality=_chunk_quality_factor(len(row[4] or ""),exempt=fts_hit or filename_match)
+        # Internal-only signal (deliberately not added to `match` below): does
+        # an expand_query() abbreviation term appear in this candidate's
+        # filename. See ABBREVIATION_FILENAME_MATCH_BONUS's docstring - never
+        # computed when filename_match already fired (no double bonus).
+        abbreviation_filename_match=(not filename_match) and bool(abbreviation_needles) and any(abbr in row[0].casefold() for abbr in abbreviation_needles)
+        quality=_chunk_quality_factor(len(row[4] or ""),exempt=fts_hit or filename_match or abbreviation_filename_match)
         # KROK 7: when the cross-encoder actually ran, its score IS the final
         # precision score - not blended with RRF/cosine/BM25 via new manual
         # weights. Those signals stay available for diagnostics in `match`/
         # SearchTrace, they just no longer determine the order.
-        score=ce_score_by_id[cid] if ce_score_by_id is not None else rrf_scores[cid]*quality+(FILENAME_MATCH_BONUS if filename_match else 0.0)
+        score=ce_score_by_id[cid] if ce_score_by_id is not None else rrf_scores[cid]*quality+(FILENAME_MATCH_BONUS if filename_match else ABBREVIATION_FILENAME_MATCH_BONUS if abbreviation_filename_match else 0.0)
         match={"fts_hit":fts_hit,"vector_hit":cid in vector_id_set,"semantic_similarity":max(similarity_by_id.get(cid,0.0),0.0),"filename_match":filename_match,"chunk_quality":quality}
         if ce_score_by_id is not None: match["cross_encoder_score"]=ce_score_by_id[cid]
         output.append({"document":row[0],"path":row[1],"project":row[2],"quote":row[4][:700],"heading":row[3],"score":score,"match":match})
