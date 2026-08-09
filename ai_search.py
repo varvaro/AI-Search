@@ -243,9 +243,20 @@ class MsgParsingWatchdog(ParsingWatchdog):
             if error: raise RuntimeError(error)
             return result
 
+# HP Sure Click (Bromium) mirrors every file a user opens into a "~BROMIUM"
+# sibling folder. Those copies are either few-hundred-byte stubs no parser can
+# read - 10 of them were the single largest error class of the 2026-08-09
+# production run, all of them "PDF nelze převést pro OCR" - or redundant copies
+# of a document already indexed from its real location. Never a source of
+# unique content, so the whole directory is pruned at walk level and never
+# reaches extraction. Casefolded because the surrounding filesystems
+# (APFS/HFS+, Box) are case-insensitive; matched as a whole path component, so
+# a real folder like "~BROMIUM_zaloha" is still indexed.
+BROMIUM_DIRECTORY = "~bromium"
+
 def iter_documents(root):
     for directory, dirs, files in os.walk(root, followlinks=False):
-        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d.casefold() != BROMIUM_DIRECTORY]
         for name in files:
             path = Path(directory) / name
             if not name.startswith(".") and path.suffix.lower() in SUPPORTED: yield path

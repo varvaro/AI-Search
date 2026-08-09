@@ -140,3 +140,50 @@ def test_confirmed_missing_document_is_removed(indexed):
     counts = ai_search.sync(root, db, lance, embeddings)
     assert counts["removed"] == 1 and counts["removal_skipped"] == 0
     assert document_count(db) == 2
+
+
+# --- 5. Sken vynechává ~BROMIUM (HP Sure Click) -----------------------------
+# Produkce 2026-08-09: 10 z 17 chyb indexace byly několikasetbajtové stuby,
+# které Sure Click zrcadlí do "~BROMIUM"; originály byly zaindexované ze svých
+# skutečných umístění. Viz BROMIUM_DIRECTORY v ai_search.py.
+
+def bromium_tree(tmp_path):
+    root = tmp_path / "Projekt"
+    (root / "~BROMIUM").mkdir(parents=True)
+    (root / "podslozka" / "~BROMIUM").mkdir(parents=True)
+    (root / "~bromium_zaloha").mkdir()
+    files = {
+        root / "dokument.pdf": True,                          # běžný dokument mimo izolaci
+        root / "podslozka" / "vnoreny.pdf": True,
+        root / "~bromium_zaloha" / "zaloha.pdf": True,        # jen podobný název, ne izolace
+        root / "~BROMIUM" / "stub.pdf": False,
+        root / "podslozka" / "~BROMIUM" / "vnoreny-stub.pdf": False,
+    }
+    for path in files:
+        path.write_bytes(b"%PDF-1.4 obsah")
+    return root, {path.name for path, indexed in files.items() if indexed}
+
+
+def test_bromium_files_are_skipped_and_normal_files_are_kept(tmp_path):
+    root, expected = bromium_tree(tmp_path)
+    assert {path.name for path in ai_search.iter_documents(root)} == expected
+
+
+def test_bromium_match_is_case_insensitive(tmp_path):
+    """APFS/HFS+ i Box jsou case-insensitive, takže složka může být uložená
+    jako "~Bromium" i "~BROMIUM" - obojí je stejná Sure Click izolace."""
+    root = tmp_path / "Projekt"
+    (root / "~Bromium").mkdir(parents=True)
+    (root / "~Bromium" / "stub.pdf").write_bytes(b"%PDF-1.4 obsah")
+    (root / "dokument.pdf").write_bytes(b"%PDF-1.4 obsah")
+    assert [path.name for path in ai_search.iter_documents(root)] == ["dokument.pdf"]
+
+
+def test_sync_does_not_report_bromium_stubs_as_errors(tmp_path):
+    root = tmp_path / "Projekt"
+    (root / "~BROMIUM").mkdir(parents=True)
+    (root / "~BROMIUM" / "stub.pdf").write_bytes(b"tohle neni PDF")   # stub, který by parser neotevřel
+    (root / "dokument.txt").write_text("Betonáž základové desky.", encoding="utf-8")
+    counts = ai_search.sync(root, tmp_path / "state" / "index.sqlite3", tmp_path / "state" / "lance", FakeEmbeddings())
+    assert counts["errors"] == 0
+    assert counts["added"] == 1
