@@ -8,7 +8,13 @@ import ai_search
 from ai_search import run_with_timeout
 from ai_search_config import APP_SUPPORT_DIR, EMBEDDING_MODEL, DEFAULT_MODEL
 
-APP_VERSION="1.0.0-rc1"
+# Must track the Git release tag this code ships as, without the "v" prefix -
+# it is what the diagnostic HTML/PDF export prints as "Verze:", i.e. the only
+# version an internal user can quote when reporting a problem. Bump it in the
+# same change that prepares a release tag; tests/test_diagnostics.py asserts it
+# stays a plain X.Y.Z release string so a pre-release placeholder cannot silently
+# outlive the release again (it sat at "1.0.0-rc1" through v1.1.0-v1.1.2).
+APP_VERSION="1.1.3"
 KNOWN_EXTENSIONS=("PDF","DOCX","XLSX","TXT","RTF","EML","MSG","HTML")
 REPORT_FONT_CANDIDATES=(
     Path("/System/Library/Fonts/Supplemental/Arial.ttf"),

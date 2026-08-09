@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 
 import ai_search
@@ -23,6 +24,22 @@ def test_index_verification_and_rc1(tmp_path):
     assert check["documents"]==1 and check["chunks"]==1 and check["embeddings"]==1
     data=diagnostics.collect_diagnostics(str(root),base)
     assert data["rc1"] and data["counts"]=={"documents":1,"chunks":1,"embeddings":1}
+
+
+def test_app_version_is_a_plain_release_version():
+    """APP_VERSION is what the exported report shows as "Verze:", so it must be
+    a released X.Y.Z tag - not a pre-release placeholder. It sat at "1.0.0-rc1"
+    across v1.1.0-v1.1.2, which made every exported diagnostic misreport the
+    version an internal user would quote in a problem report. No assertion
+    against the actual Git tag here on purpose: CI checks out without tags."""
+    assert re.fullmatch(r"\d+\.\d+\.\d+",diagnostics.APP_VERSION),diagnostics.APP_VERSION
+
+
+def test_exported_report_states_the_app_version(tmp_path):
+    base,root,_,_=prepared_runtime(tmp_path); data=diagnostics.collect_diagnostics(str(root),base)
+    assert data["version"]==diagnostics.APP_VERSION
+    html,_=diagnostics.export_reports(data,base)
+    assert f"Verze: {diagnostics.APP_VERSION}" in html.read_text(encoding="utf-8")
 
 
 def test_report_font_supports_required_czech_glyphs():
