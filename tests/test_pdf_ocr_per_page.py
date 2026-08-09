@@ -67,6 +67,11 @@ def portable_private_tmp(monkeypatch, tmp_path):
     monkeypatch.setattr(ai_search.tempfile, "TemporaryDirectory", temporary_directory)
 
 
+@pytest.fixture
+def fake_ocr_tools(monkeypatch):
+    monkeypatch.setattr(ai_search, "resolve_system_tool", lambda name: f"/tools/{name}")
+
+
 def _font(size):
     try: return ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", size)
     except Exception: return ImageFont.load_default()
@@ -185,7 +190,7 @@ def test_c_multi_page_ocr_preserves_page_order_real_subprocesses(tmp_path):
 # ---------------------------------------------------------------------------
 # D) page render timeout skips only that page, others still succeed
 # ---------------------------------------------------------------------------
-def test_d_one_page_render_timeout_skips_only_that_page(tmp_path, monkeypatch, portable_private_tmp):
+def test_d_one_page_render_timeout_skips_only_that_page(tmp_path, monkeypatch, portable_private_tmp, fake_ocr_tools):
     pdf = tmp_path / "scan.pdf"; pdf.write_bytes(b"%PDF-fake")
     monkeypatch.setattr(ai_search, "_pdf_page_count", lambda path, timeout=10: 3)
     monkeypatch.setattr(ai_search.subprocess, "run", lambda *a, **k: type("R", (), {"stdout": ""})())
@@ -209,7 +214,7 @@ def test_d_one_page_render_timeout_skips_only_that_page(tmp_path, monkeypatch, p
 # ---------------------------------------------------------------------------
 # E) Tesseract timeout of one page skips only that page
 # ---------------------------------------------------------------------------
-def test_e_one_page_tesseract_timeout_skips_only_that_page(tmp_path, monkeypatch, portable_private_tmp):
+def test_e_one_page_tesseract_timeout_skips_only_that_page(tmp_path, monkeypatch, portable_private_tmp, fake_ocr_tools):
     pdf = tmp_path / "scan.pdf"; pdf.write_bytes(b"%PDF-fake")
     monkeypatch.setattr(ai_search, "_pdf_page_count", lambda path, timeout=10: 3)
     monkeypatch.setattr(ai_search.subprocess, "run", lambda *a, **k: type("R", (), {"stdout": ""})())
@@ -246,7 +251,7 @@ def test_f_temp_files_cleaned_up_after_success(tmp_path):
 # ---------------------------------------------------------------------------
 # G) temp files cleaned up after the document-level budget is exceeded
 # ---------------------------------------------------------------------------
-def test_g_temp_files_cleaned_up_after_document_budget_exceeded(tmp_path, monkeypatch, portable_private_tmp):
+def test_g_temp_files_cleaned_up_after_document_budget_exceeded(tmp_path, monkeypatch, portable_private_tmp, fake_ocr_tools):
     before = _leftover_ocr_tempdirs()
     pdf = tmp_path / "scan.pdf"; pdf.write_bytes(b"%PDF-fake")
     monkeypatch.setattr(ai_search, "_pdf_page_count", lambda path, timeout=10: 5)
@@ -271,7 +276,7 @@ def test_g_temp_files_cleaned_up_after_document_budget_exceeded(tmp_path, monkey
 # ---------------------------------------------------------------------------
 # H) temp files cleaned up after an unhandled exception (all pages fail)
 # ---------------------------------------------------------------------------
-def test_h_temp_files_cleaned_up_after_all_pages_fail(tmp_path, monkeypatch, portable_private_tmp):
+def test_h_temp_files_cleaned_up_after_all_pages_fail(tmp_path, monkeypatch, portable_private_tmp, fake_ocr_tools):
     before = _leftover_ocr_tempdirs()
     pdf = tmp_path / "scan.pdf"; pdf.write_bytes(b"%PDF-fake")
     monkeypatch.setattr(ai_search, "_pdf_page_count", lambda path, timeout=10: 2)
@@ -351,7 +356,7 @@ def test_pdf_page_count_valid_and_invalid(tmp_path):
 # test itself runs in well under a second while still exercising the real
 # extract_pdf()/_extract_pdf_per_page() deadline arithmetic and page loop.
 # ---------------------------------------------------------------------------
-def test_large_pdf_completes_beyond_old_60s_single_call_cap(tmp_path, monkeypatch, portable_private_tmp):
+def test_large_pdf_completes_beyond_old_60s_single_call_cap(tmp_path, monkeypatch, portable_private_tmp, fake_ocr_tools):
     pdf = tmp_path / "big_scan.pdf"; pdf.write_bytes(b"%PDF-fake")
     page_count = 15
     per_page_seconds = 5.0  # 15 * 5s = 75s total > old hard-coded 60s pdftoppm cap
