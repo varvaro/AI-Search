@@ -344,6 +344,7 @@ def test_broken_pdf_is_recorded_and_other_files_continue(tmp_path,monkeypatch):
 
 def test_pdf_parser_timeout_is_bounded(tmp_path,monkeypatch):
     pdf=tmp_path/"slow.pdf"; pdf.write_bytes(b"%PDF")
+    monkeypatch.setattr(ai_search,"resolve_system_tool",lambda name:f"/tools/{name}")
     monkeypatch.setattr(ai_search.subprocess,"run",lambda *args,**kwargs: (_ for _ in ()).throw(ai_search.subprocess.TimeoutExpired(args[0],1)))
     with pytest.raises(TimeoutError): ai_search.extract_pdf(pdf,budget_seconds=1)
 
