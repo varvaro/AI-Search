@@ -217,13 +217,20 @@ else:
         if st.session_state.get("last_query")!=query: st.session_state.visible_results=PAGE_SIZE; st.session_state.last_query=query
         started=time.perf_counter()
         with st.spinner("Hledám v dostupných zdrojích…"):
-            rows=search_all(query,settings,STATE,embeddings(),is_question=classification["mode"]=="otazka",expand_query=QUERY_EXPANSION_MODE); start=date_range[0] if len(date_range)>0 else None; end=date_range[-1] if len(date_range)>1 else None; rows=apply_filters(rows,source,"Vše" if not project_filter else project_filter,folder,"Vše" if not extension else extension,author,start,end)
+            rows=search_all(query,settings,STATE,embeddings(),is_question=classification["mode"]=="otazka",expand_query=QUERY_EXPANSION_MODE)
+            raw_result_count=len(rows)  # počet výsledků před filtrováním
+            start=date_range[0] if len(date_range)>0 else None; end=date_range[-1] if len(date_range)>1 else None
+            rows=apply_filters(rows,source,"Vše" if not project_filter else project_filter,folder,"Vše" if not extension else extension,author,start,end)
         elapsed=time.perf_counter()-started; search_mode="AI odpověď" if mode=="Položit otázku" else "Hybrid (fulltext + význam)"
         st.caption(f"Nalezeno: {len(rows)} dokumentů · čas {elapsed:.2f} s · režim {search_mode}")
         if not rows:
             with st.container(border=True):
-                st.warning("Nebyly nalezeny žádné odpovídající výsledky.")
-                st.caption("Zkuste upravit klíčová slova, zkontrolovat aktivní filtry, nebo ověřit, že je projekt zaindexovaný.")
+                if raw_result_count>0:
+                    st.warning(f"Byly nalezeny dokumenty ({raw_result_count}), ale byly odstraněny aktivními filtry.")
+                    st.caption("Zkuste upravit nebo zrušit filtry (Zdroj, Projekt, Podsložka, Typ souboru, Autor, Datum).")
+                else:
+                    st.warning("Vyhledávání nenalezlo žádné dokumenty.")
+                    st.caption("Zkuste upravit klíčová slova, nebo ověřit, že je projekt zaindexovaný.")
         elif mode=="Položit otázku":
             original_default,original_complex=ai_search.DEFAULT_MODEL,ai_search.COMPLEX_MODEL
             try:
