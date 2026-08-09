@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Hybridní backend AI Search nad lokální složkou Box Drive."""
 from __future__ import annotations
-import argparse, collections, contextlib, fcntl, gc, hashlib, json, logging, multiprocessing, os, queue, re, resource, sqlite3, subprocess, tempfile, threading, time, traceback, urllib.request, uuid
+import argparse, collections, contextlib, fcntl, gc, hashlib, json, logging, multiprocessing, os, queue, re, resource, shutil, sqlite3, subprocess, tempfile, threading, time, traceback, urllib.request, uuid
 import numpy as np
 from pathlib import Path
 from ai_search_config import BOX_ROOT, STATE_DIR, EMBEDDING_MODEL, OLLAMA_ENDPOINT, DEFAULT_MODEL, COMPLEX_MODEL, PARSE_TIMEOUT_SECONDS, CHUNK_TIMEOUT_SECONDS, EMBEDDING_TIMEOUT_SECONDS, EMBEDDING_BATCH_SIZE, MSG_PARSE_TIMEOUT_SECONDS
@@ -10,6 +10,20 @@ import parsing_worker  # stable multiprocessing.Process targets, see parsing_wor
 import query_expansion  # Query Understanding layer, opt-in via search(expand_query=True)
 
 SUPPORTED = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".txt", ".md", ".csv", ".rtf", ".eml", ".msg", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp"}
+
+def resolve_system_tool(name):
+    """Resolve a CLI tool from PATH, then common Homebrew prefixes."""
+    resolved=shutil.which(name)
+    if resolved: return resolved
+    for prefix in (Path("/opt/homebrew/bin"),Path("/usr/local/bin")):
+        candidate=prefix/name
+        if candidate.is_file() and os.access(candidate,os.X_OK): return str(candidate)
+    return None
+
+def _required_system_tool(name):
+    resolved=resolve_system_tool(name)
+    if resolved is None: raise RuntimeError(f"Systémový nástroj '{name}' není dostupný.")
+    return resolved
 
 def sha256_file(path):
     result = [None]; error = [None]
@@ -332,7 +346,8 @@ def extract(path):
         # straight into the chunker as if they were prose.
         run = subprocess.run(["/usr/bin/textutil", "-convert", "txt", "-stdout", str(path)], capture_output=True, check=False, timeout=PARSE_TIMEOUT_SECONDS)
         return run.stdout.decode("utf-8", errors="replace"), "textutil"
-    run = subprocess.run(["/opt/homebrew/bin/tesseract", str(path), "stdout", "-l", "ces+eng"], capture_output=True, check=False, timeout=PARSE_TIMEOUT_SECONDS)
+    tesseract=_required_system_tool("tesseract")
+    run = subprocess.run([tesseract, str(path), "stdout", "-l", "ces+eng"], capture_output=True, check=False, timeout=PARSE_TIMEOUT_SECONDS)
     return run.stdout.decode("utf-8", errors="replace"), "stav_skenu_ocr"
 
 # --- PDF OCR: per-page architecture -----------------------------------------
@@ -385,8 +400,10 @@ def _pdf_page_count(path, timeout=10):
     files). Returns None if it cannot be determined (corrupt/unusual PDF,
     pdfinfo missing, or a non-PDF fed to this path in a test) so callers fall
     back to a conservative whole-document path rather than guessing a range."""
+    pdfinfo=resolve_system_tool("pdfinfo")
+    if pdfinfo is None: return None
     try:
-        run=subprocess.run(["/opt/homebrew/bin/pdfinfo",str(path)],capture_output=True,text=True,check=False,timeout=timeout)
+        run=subprocess.run([pdfinfo,str(path)],capture_output=True,text=True,check=False,timeout=timeout)
     except (subprocess.TimeoutExpired, OSError): return None
     if run.returncode: return None
     for line in run.stdout.splitlines():
@@ -438,13 +455,14 @@ def _pdf_page_marker(page,reason):
     return f"[OCR SELHALA STRÁNKA {page}: {reason}]"
 
 def _extract_pdf_per_page(path,page_count,deadline):
-    with tempfile.TemporaryDirectory(prefix="ai-search-ocr-",dir="/private/tmp") as folder:
+    pdftoppm=_required_system_tool("pdftoppm"); tesseract=_required_system_tool("tesseract")
+    with tempfile.TemporaryDirectory(prefix="ai-search-ocr-") as folder:
         folder_path=Path(folder); parts=[]; failed=0
         for page in range(1,page_count+1):
             remaining=deadline-time.monotonic()
             if remaining<=0: parts.append(_pdf_page_marker(page,"překročen časový limit dokumentu")); failed+=1; continue
             prefix=str(folder_path/"page")
-            try: rendered=_run_ocr_subprocess(["/opt/homebrew/bin/pdftoppm","-r","300","-png","-f",str(page),"-l",str(page),str(path),prefix],min(PDF_PAGE_RENDER_TIMEOUT_SECONDS,remaining))
+            try: rendered=_run_ocr_subprocess([pdftoppm,"-r","300","-png","-f",str(page),"-l",str(page),str(path),prefix],min(PDF_PAGE_RENDER_TIMEOUT_SECONDS,remaining))
             except subprocess.TimeoutExpired:
                 parts.append(_pdf_page_marker(page,"render překročil časový limit")); failed+=1; _cleanup_page_images(folder_path); continue
             if rendered.returncode:
@@ -455,7 +473,7 @@ def _extract_pdf_per_page(path,page_count,deadline):
             image=images[0]; remaining=deadline-time.monotonic()
             if remaining<=0:
                 parts.append(_pdf_page_marker(page,"překročen časový limit dokumentu")); failed+=1; _cleanup_page_images(folder_path); continue
-            try: run=_run_ocr_subprocess(["/opt/homebrew/bin/tesseract",str(image),"stdout","-l","ces+eng","--psm","6"],min(PDF_PAGE_OCR_TIMEOUT_SECONDS,remaining))
+            try: run=_run_ocr_subprocess([tesseract,str(image),"stdout","-l","ces+eng","--psm","6"],min(PDF_PAGE_OCR_TIMEOUT_SECONDS,remaining))
             except subprocess.TimeoutExpired: parts.append(_pdf_page_marker(page,"OCR překročil časový limit")); failed+=1
             else:
                 if run.returncode: parts.append(_pdf_page_marker(page,"OCR selhal")); failed+=1
@@ -473,10 +491,11 @@ def _extract_pdf_whole_document(path,deadline):
     # not meaningfully help here). Mirrors the old whole-document render but
     # keeps per-page OCR timeouts/partial-page policy for the OCR half, and is
     # bounded by the same page-count-derived budget (page_count treated as 1).
-    with tempfile.TemporaryDirectory(prefix="ai-search-ocr-",dir="/private/tmp") as folder:
+    pdftoppm=_required_system_tool("pdftoppm"); tesseract=_required_system_tool("tesseract")
+    with tempfile.TemporaryDirectory(prefix="ai-search-ocr-") as folder:
         folder_path=Path(folder); remaining=deadline-time.monotonic()
         if remaining<=0: raise TimeoutError("PDF překročilo časový limit před OCR")
-        try: rendered=_run_ocr_subprocess(["/opt/homebrew/bin/pdftoppm","-r","300","-png",str(path),str(folder_path/"page")],remaining)
+        try: rendered=_run_ocr_subprocess([pdftoppm,"-r","300","-png",str(path),str(folder_path/"page")],remaining)
         except subprocess.TimeoutExpired as exc: raise TimeoutError("Převod PDF pro OCR překročil časový limit") from exc
         if rendered.returncode: raise RuntimeError("PDF nelze převést pro OCR: "+(rendered.stderr.strip() or str(rendered.returncode)))
         images=sorted(folder_path.glob("page-*.png")); parts=[]; failed=0
@@ -484,7 +503,7 @@ def _extract_pdf_whole_document(path,deadline):
             remaining=deadline-time.monotonic()
             if remaining<=0: parts.append(_pdf_page_marker(index,"překročen časový limit dokumentu")); failed+=1
             else:
-                try: run=_run_ocr_subprocess(["/opt/homebrew/bin/tesseract",str(image),"stdout","-l","ces+eng","--psm","6"],min(PDF_PAGE_OCR_TIMEOUT_SECONDS,remaining))
+                try: run=_run_ocr_subprocess([tesseract,str(image),"stdout","-l","ces+eng","--psm","6"],min(PDF_PAGE_OCR_TIMEOUT_SECONDS,remaining))
                 except subprocess.TimeoutExpired: parts.append(_pdf_page_marker(index,"OCR překročil časový limit")); failed+=1
                 else:
                     if run.returncode: parts.append(_pdf_page_marker(index,"OCR selhal")); failed+=1
@@ -500,8 +519,10 @@ def extract_pdf(path, budget_seconds=None):
     page_count=_pdf_page_count(path)
     if budget_seconds is None: budget_seconds=pdf_ocr_document_budget_seconds(page_count)
     deadline=time.monotonic()+budget_seconds
-    try: direct=subprocess.run(["/opt/homebrew/bin/pdftotext","-layout",str(path),"-"],capture_output=True,text=True,check=False,timeout=min(PDF_NATIVE_TEXT_TIMEOUT_SECONDS,budget_seconds)).stdout
+    pdftotext=resolve_system_tool("pdftotext")
+    try: direct=subprocess.run([pdftotext,"-layout",str(path),"-"],capture_output=True,text=True,check=False,timeout=min(PDF_NATIVE_TEXT_TIMEOUT_SECONDS,budget_seconds)).stdout if pdftotext else ""
     except subprocess.TimeoutExpired as exc: raise TimeoutError("Textová vrstva PDF překročila časový limit") from exc
+    except OSError: direct=""
     if len(direct.strip())>=80: return direct
     remaining=deadline-time.monotonic()
     if remaining<=0: raise TimeoutError("PDF překročilo časový limit před OCR")

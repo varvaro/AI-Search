@@ -116,6 +116,30 @@ def _leftover_ocr_tempdirs():
     return {p for p in Path("/private/tmp").glob("ai-search-ocr-*")}
 
 
+def test_missing_pdftotext_falls_back_to_ocr(tmp_path, monkeypatch):
+    pdf = tmp_path / "scan.pdf"; pdf.write_bytes(b"%PDF-fake")
+    monkeypatch.setattr(ai_search, "_pdf_page_count", lambda path: 1)
+    monkeypatch.setattr(ai_search, "resolve_system_tool", lambda name: None if name == "pdftotext" else f"/tools/{name}")
+    monkeypatch.setattr(ai_search, "_extract_pdf_per_page", lambda path, page_count, deadline: "OCR FALLBACK")
+    assert ai_search.extract_pdf(pdf) == "OCR FALLBACK"
+
+
+def test_missing_pdfinfo_uses_whole_document_fallback(tmp_path, monkeypatch):
+    pdf = tmp_path / "scan.pdf"; pdf.write_bytes(b"%PDF-fake")
+    monkeypatch.setattr(ai_search, "resolve_system_tool", lambda name: None if name in {"pdfinfo", "pdftotext"} else f"/tools/{name}")
+    monkeypatch.setattr(ai_search, "_extract_pdf_whole_document", lambda path, deadline: "WHOLE DOCUMENT FALLBACK")
+    monkeypatch.setattr(ai_search, "_extract_pdf_per_page", lambda *args: (_ for _ in ()).throw(AssertionError("per-page fallback must not run")))
+    assert ai_search.extract_pdf(pdf) == "WHOLE DOCUMENT FALLBACK"
+
+
+@pytest.mark.parametrize("missing_tool", ["pdftoppm", "tesseract"])
+def test_missing_ocr_tool_raises_readable_error(tmp_path, monkeypatch, missing_tool):
+    pdf = tmp_path / "scan.pdf"; pdf.write_bytes(b"%PDF-fake")
+    monkeypatch.setattr(ai_search, "resolve_system_tool", lambda name: None if name == missing_tool else f"/tools/{name}")
+    with pytest.raises(RuntimeError, match=missing_tool):
+        ai_search._extract_pdf_per_page(pdf, 1, time.monotonic() + 10)
+
+
 # ---------------------------------------------------------------------------
 # A) native text layer -> no OCR at all
 # ---------------------------------------------------------------------------

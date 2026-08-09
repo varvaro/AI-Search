@@ -146,7 +146,7 @@ def test_preview_text_and_missing(tmp_path):
     assert ui.preview_document(tmp_path/"missing.pdf")["kind"]=="error"
 
 def test_render_pdf_first_page_writes_png(tmp_path,monkeypatch):
-    fake_bin=tmp_path/"pdftoppm"; fake_bin.write_text("stub"); monkeypatch.setattr(ui,"PDFTOPPM_BIN",str(fake_bin))
+    fake_bin=tmp_path/"pdftoppm"; fake_bin.write_text("stub"); monkeypatch.setattr(ai_search,"resolve_system_tool",lambda name:str(fake_bin))
     def fake_runner(args,**kwargs):
         prefix=Path(args[-1]); (prefix.parent/f"{prefix.name}-1.png").write_bytes(b"PNGDATA")
         class Result: returncode=0
@@ -154,17 +154,17 @@ def test_render_pdf_first_page_writes_png(tmp_path,monkeypatch):
     assert ui.render_pdf_first_page(tmp_path/"doc.pdf",runner=fake_runner)==b"PNGDATA"
 
 def test_render_pdf_first_page_returns_none_on_failure(tmp_path,monkeypatch):
-    fake_bin=tmp_path/"pdftoppm"; fake_bin.write_text("stub"); monkeypatch.setattr(ui,"PDFTOPPM_BIN",str(fake_bin))
+    fake_bin=tmp_path/"pdftoppm"; fake_bin.write_text("stub"); monkeypatch.setattr(ai_search,"resolve_system_tool",lambda name:str(fake_bin))
     class Result: returncode=1
     assert ui.render_pdf_first_page(tmp_path/"doc.pdf",runner=lambda *a,**k:Result()) is None
 
 def test_render_pdf_first_page_returns_none_on_timeout(tmp_path,monkeypatch):
-    fake_bin=tmp_path/"pdftoppm"; fake_bin.write_text("stub"); monkeypatch.setattr(ui,"PDFTOPPM_BIN",str(fake_bin))
+    fake_bin=tmp_path/"pdftoppm"; fake_bin.write_text("stub"); monkeypatch.setattr(ai_search,"resolve_system_tool",lambda name:str(fake_bin))
     def timeout_runner(*a,**k): raise subprocess.TimeoutExpired(cmd="pdftoppm",timeout=20)
     assert ui.render_pdf_first_page(tmp_path/"doc.pdf",runner=timeout_runner) is None
 
 def test_render_pdf_first_page_returns_none_when_binary_missing(tmp_path,monkeypatch):
-    monkeypatch.setattr(ui,"PDFTOPPM_BIN",str(tmp_path/"does-not-exist"))
+    monkeypatch.setattr(ai_search,"resolve_system_tool",lambda name:None)
     assert ui.render_pdf_first_page(tmp_path/"doc.pdf",runner=lambda *a,**k:(_ for _ in ()).throw(AssertionError("should not run"))) is None
 
 def test_preview_document_uses_image_when_rendering_succeeds(tmp_path,monkeypatch):

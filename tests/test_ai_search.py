@@ -22,6 +22,31 @@ def write_office(path: Path, member: str, xml: str):
         archive.writestr(member, xml)
 
 
+def test_resolve_system_tool_uses_path_first(monkeypatch):
+    monkeypatch.setattr(ai_search.shutil, "which", lambda name: f"/usr/bin/{name}")
+    assert ai_search.resolve_system_tool("pdfinfo") == "/usr/bin/pdfinfo"
+
+
+def test_resolve_system_tool_uses_homebrew_fallback(monkeypatch):
+    monkeypatch.setattr(ai_search.shutil, "which", lambda name: None)
+    monkeypatch.setattr(Path, "is_file", lambda path: str(path) == "/usr/local/bin/pdfinfo")
+    monkeypatch.setattr(ai_search.os, "access", lambda path, mode: True)
+    assert ai_search.resolve_system_tool("pdfinfo") == "/usr/local/bin/pdfinfo"
+
+
+def test_resolve_system_tool_prefers_apple_silicon_homebrew(monkeypatch):
+    monkeypatch.setattr(ai_search.shutil, "which", lambda name: None)
+    monkeypatch.setattr(Path, "is_file", lambda path: True)
+    monkeypatch.setattr(ai_search.os, "access", lambda path, mode: True)
+    assert ai_search.resolve_system_tool("pdfinfo") == "/opt/homebrew/bin/pdfinfo"
+
+
+def test_resolve_system_tool_returns_none_when_missing(monkeypatch):
+    monkeypatch.setattr(ai_search.shutil, "which", lambda name: None)
+    monkeypatch.setattr(Path, "is_file", lambda path: False)
+    assert ai_search.resolve_system_tool("pdfinfo") is None
+
+
 @pytest.fixture
 def backend(tmp_path, monkeypatch):
     root = tmp_path / "Projekt Alpha"; root.mkdir()
