@@ -1,31 +1,8 @@
 import json
 from pathlib import Path
 
-import pytest
-import reportlab
-
 import ai_search
 import diagnostics
-
-MACOS_REPORT_FONTS = (
-    Path("/System/Library/Fonts/Supplemental/Arial.ttf"),
-    Path("/Library/Fonts/Arial Unicode.ttf"),
-)
-
-
-def configure_portable_report_font(monkeypatch):
-    if any(path.is_file() for path in MACOS_REPORT_FONTS):
-        return
-    fallback = Path(reportlab.__file__).parent / "fonts" / "Vera.ttf"
-    if not fallback.is_file():
-        pytest.skip("no compatible ReportLab font is available")
-    original_path = diagnostics.Path
-
-    def portable_path(value):
-        path = original_path(value)
-        return fallback if path in MACOS_REPORT_FONTS else path
-
-    monkeypatch.setattr(diagnostics, "Path", portable_path)
 
 
 class FakeEmbeddings:
@@ -48,9 +25,14 @@ def test_index_verification_and_rc1(tmp_path):
     assert data["rc1"] and data["counts"]=={"documents":1,"chunks":1,"embeddings":1}
 
 
-def test_diagnostic_export_creates_html_and_pdf(tmp_path, monkeypatch):
+def test_report_font_supports_required_czech_glyphs():
+    font_path=diagnostics._report_font_path()
+    assert font_path is not None
+    assert diagnostics._font_supports_czech(font_path)
+
+
+def test_diagnostic_export_creates_html_and_pdf(tmp_path):
     base,root,_,_=prepared_runtime(tmp_path); data=diagnostics.collect_diagnostics(str(root),base)
-    configure_portable_report_font(monkeypatch)
     html,pdf=diagnostics.export_reports(data,base)
     assert html.exists() and "AI SEARCH RC1" in html.read_text(encoding="utf-8")
     assert pdf.exists() and pdf.read_bytes().startswith(b"%PDF") and pdf.stat().st_size>1000

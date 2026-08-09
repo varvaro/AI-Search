@@ -22,6 +22,31 @@ def write_office(path: Path, member: str, xml: str):
         archive.writestr(member, xml)
 
 
+def test_resolve_system_tool_uses_path_first(monkeypatch):
+    monkeypatch.setattr(ai_search.shutil, "which", lambda name: f"/usr/bin/{name}")
+    assert ai_search.resolve_system_tool("pdfinfo") == "/usr/bin/pdfinfo"
+
+
+def test_resolve_system_tool_uses_homebrew_fallback(monkeypatch):
+    monkeypatch.setattr(ai_search.shutil, "which", lambda name: None)
+    monkeypatch.setattr(Path, "is_file", lambda path: str(path) == "/usr/local/bin/pdfinfo")
+    monkeypatch.setattr(ai_search.os, "access", lambda path, mode: True)
+    assert ai_search.resolve_system_tool("pdfinfo") == "/usr/local/bin/pdfinfo"
+
+
+def test_resolve_system_tool_prefers_apple_silicon_homebrew(monkeypatch):
+    monkeypatch.setattr(ai_search.shutil, "which", lambda name: None)
+    monkeypatch.setattr(Path, "is_file", lambda path: True)
+    monkeypatch.setattr(ai_search.os, "access", lambda path, mode: True)
+    assert ai_search.resolve_system_tool("pdfinfo") == "/opt/homebrew/bin/pdfinfo"
+
+
+def test_resolve_system_tool_returns_none_when_missing(monkeypatch):
+    monkeypatch.setattr(ai_search.shutil, "which", lambda name: None)
+    monkeypatch.setattr(Path, "is_file", lambda path: False)
+    assert ai_search.resolve_system_tool("pdfinfo") is None
+
+
 @pytest.fixture
 def backend(tmp_path, monkeypatch):
     root = tmp_path / "Projekt Alpha"; root.mkdir()
@@ -319,6 +344,7 @@ def test_broken_pdf_is_recorded_and_other_files_continue(tmp_path,monkeypatch):
 
 def test_pdf_parser_timeout_is_bounded(tmp_path,monkeypatch):
     pdf=tmp_path/"slow.pdf"; pdf.write_bytes(b"%PDF")
+    monkeypatch.setattr(ai_search,"resolve_system_tool",lambda name:f"/tools/{name}")
     monkeypatch.setattr(ai_search.subprocess,"run",lambda *args,**kwargs: (_ for _ in ()).throw(ai_search.subprocess.TimeoutExpired(args[0],1)))
     with pytest.raises(TimeoutError): ai_search.extract_pdf(pdf,budget_seconds=1)
 

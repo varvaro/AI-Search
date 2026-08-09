@@ -10,6 +10,38 @@ from ai_search_config import APP_SUPPORT_DIR, EMBEDDING_MODEL, DEFAULT_MODEL
 
 APP_VERSION="1.0.0-rc1"
 KNOWN_EXTENSIONS=("PDF","DOCX","XLSX","TXT","RTF","EML","MSG","HTML")
+REPORT_FONT_CANDIDATES=(
+    Path("/System/Library/Fonts/Supplemental/Arial.ttf"),
+    Path("/Library/Fonts/Arial Unicode.ttf"),
+    Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+    Path("/usr/share/fonts/dejavu/DejaVuSans.ttf"),
+    Path("/usr/local/share/fonts/DejaVuSans.ttf"),
+)
+REPORT_REQUIRED_GLYPHS="ěřůťňĚŘŮ"
+
+def _font_supports_czech(path: Path) -> bool:
+    try:
+        from reportlab.pdfbase.ttfonts import TTFont
+        font=TTFont("AISearchFontProbe",str(path))
+    except Exception:
+        return False
+    return all(ord(character) in font.face.charToGlyph for character in REPORT_REQUIRED_GLYPHS)
+
+def _report_font_path() -> Path | None:
+    candidates=list(REPORT_FONT_CANDIDATES)
+    try:
+        import reportlab
+        from reportlab import rl_config
+        candidates.extend(Path(folder)/"DejaVuSans.ttf" for folder in rl_config.TTFSearchPath)
+        candidates.append(Path(reportlab.__file__).parent/"fonts/Vera.ttf")
+    except ImportError:
+        pass
+    seen=set()
+    for candidate in candidates:
+        if candidate in seen: continue
+        seen.add(candidate)
+        if candidate.is_file() and _font_supports_czech(candidate): return candidate
+    return None
 
 def folder_size(path: Path) -> int:
     return sum(item.stat().st_size for item in path.rglob("*") if item.is_file()) if path.exists() else 0
@@ -105,8 +137,8 @@ def export_reports(data: dict,base: Path=APP_SUPPORT_DIR) -> tuple[Path,Path]:
     from reportlab.pdfbase.ttfonts import TTFont
     from reportlab.platypus import SimpleDocTemplate,Paragraph,Spacer,Table,TableStyle,PageBreak
     from reportlab.lib import colors
-    font_path=Path("/System/Library/Fonts/Supplemental/Arial.ttf")
-    if not font_path.exists(): font_path=Path("/Library/Fonts/Arial Unicode.ttf")
+    font_path=_report_font_path()
+    if font_path is None: raise RuntimeError("Pro PDF export není dostupný kompatibilní TrueType font.")
     pdfmetrics.registerFont(TTFont("AISearchUnicode",str(font_path)))
     styles=getSampleStyleSheet()
     for style_name in ("Title","Heading2","BodyText","Code"): styles[style_name].fontName="AISearchUnicode"

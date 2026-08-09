@@ -486,18 +486,18 @@ def choose_folder(prompt: str, runner=subprocess.run) -> tuple[bool,str]:
     if result.returncode!=0: return False,""
     return True,result.stdout.strip().rstrip("/")
 
-PDFTOPPM_BIN = "/opt/homebrew/bin/pdftoppm"
 PDF_PREVIEW_TIMEOUT_SECONDS = 20
 
 def render_pdf_first_page(path: Path, runner=subprocess.run) -> bytes | None:
     """Rasterize the first page of a PDF to PNG bytes using poppler's pdftoppm -
     already a project dependency (used for OCR) - so no new dependency, fully
     local/offline, and renders reliably in Safari unlike the data:-URL iframe."""
-    if not Path(PDFTOPPM_BIN).exists(): return None
+    pdftoppm=ai_search.resolve_system_tool("pdftoppm")
+    if not pdftoppm or not Path(pdftoppm).is_file(): return None
     with tempfile.TemporaryDirectory(prefix="ai-search-preview-") as folder:
         prefix=Path(folder)/"page"
         try:
-            result=runner([PDFTOPPM_BIN,"-png","-r","110","-f","1","-l","1",str(path),str(prefix)],capture_output=True,check=False,timeout=PDF_PREVIEW_TIMEOUT_SECONDS)
+            result=runner([pdftoppm,"-png","-r","110","-f","1","-l","1",str(path),str(prefix)],capture_output=True,check=False,timeout=PDF_PREVIEW_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
             return None
         if result.returncode!=0: return None
