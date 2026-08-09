@@ -1,8 +1,10 @@
 from pathlib import Path
 from email.message import EmailMessage
 import subprocess
+import threading
 
 import pytest
+import streamlit as st
 from streamlit.testing.v1 import AppTest
 import ai_search
 import ui_services as ui
@@ -13,11 +15,51 @@ class FakeEmbeddings:
     def encode(self,texts): return [[1.0,0.5,0.1] for _ in texts]
 
 def test_ui_starts_in_czech(tmp_path,monkeypatch):
+    # app.py's embeddings() resource is `st.cache_resource`-cached (shared
+    # across every AppTest run in this process, exactly like it is shared
+    # across every real user session) and is now touched unconditionally by
+    # the background warmup thread on every script run (see
+    # start_embeddings_warmup() in app.py) - both the FakeEmbeddings patch
+    # and the cache clear are required here so this test never triggers a
+    # real SentenceTransformer download, and never leaves a real instance
+    # cached for a later test to accidentally inherit.
+    st.cache_resource.clear()
+    monkeypatch.setattr(ai_search,"Embeddings",FakeEmbeddings)
     monkeypatch.setattr(ui,"ollama_status",lambda:False)
     app=AppTest.from_file(str(APP_PATH),default_timeout=10).run()
     assert not app.exception
     assert any("Najděte informace" in h.value for h in app.header)
     assert any("Aktualizovat index" in b.label for b in app.button)
+
+def test_embeddings_model_is_warmed_up_without_any_search(monkeypatch):
+    """Requirement: the embeddings resource must have a ready/warm model
+    right after app initialization - i.e. before the user submits any
+    search - not just lazily on first use. Uses a fake in place of
+    SentenceTransformer (same pattern as FakeEmbeddings elsewhere in this
+    file), so this never touches the network or downloads a real model."""
+    warmed=threading.Event()
+    class WarmupProbeEmbeddings:
+        def encode(self,texts): warmed.set(); return [[1.0,0.5,0.1] for _ in texts]
+    st.cache_resource.clear()
+    monkeypatch.setattr(ai_search,"Embeddings",WarmupProbeEmbeddings)
+    monkeypatch.setattr(ui,"ollama_status",lambda:False)
+    app=AppTest.from_file(str(APP_PATH),default_timeout=10).run()
+    assert not app.exception
+    # Warmup runs on a background daemon thread (see start_embeddings_warmup
+    # in app.py) - .run() returning does not guarantee it has finished yet,
+    # so poll briefly instead of asserting immediately.
+    assert warmed.wait(timeout=5), "embeddings warmup must call encode() during app init, with no search submitted"
+
+def test_embeddings_warmup_does_not_start_twice_in_the_same_session(monkeypatch):
+    """The `st.session_state` guard around start_embeddings_warmup() must
+    prevent a fresh background thread (and a fresh, redundant model load)
+    on every rerun of the same session - only the very first run of a given
+    session should kick it off."""
+    st.cache_resource.clear()
+    monkeypatch.setattr(ai_search,"Embeddings",FakeEmbeddings)
+    monkeypatch.setattr(ui,"ollama_status",lambda:False)
+    app=AppTest.from_file(str(APP_PATH),default_timeout=10).run()
+    assert app.session_state["embeddings_warmup_started"] is True
 
 def test_settings_roundtrip(tmp_path):
     path=tmp_path/"settings.json"; value=ui.Settings(project_root="/projekt",result_count=17)
@@ -184,11 +226,14 @@ def test_system_overview_counts_and_size(tmp_path):
     assert summary["pdf"]==1 and summary["total"]==1 and summary["size_bytes"]>0
 
 @pytest.mark.parametrize("page,heading",[("settings","Nastavení"),("history","Historie a diagnostika"),("diagnostics","Diagnostika")])
-def test_secondary_screens_render(page,heading):
+def test_secondary_screens_render(page,heading,monkeypatch):
+    st.cache_resource.clear()  # see test_ui_starts_in_czech's comment
+    monkeypatch.setattr(ai_search,"Embeddings",FakeEmbeddings)
     app=AppTest.from_file(str(APP_PATH),default_timeout=10); app.session_state["page"]=page; app.run()
     assert not app.exception and any(heading in item.value for item in app.header)
 
 def _mock_ready_ui(monkeypatch,tmp_path,rows):
+    st.cache_resource.clear()  # see test_ui_starts_in_czech's comment
     monkeypatch.setattr(ui,"index_summary",lambda state:{"total":24,"latest":"04. 08. 2026 20:00","ready":True,"pdf":20,"emails":2,"notes":2,"size_bytes":1024})
     monkeypatch.setattr(ui,"indexed_root",lambda state:str(tmp_path))
     monkeypatch.setattr(ui,"ollama_status",lambda:False)

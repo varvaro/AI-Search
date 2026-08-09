@@ -1,5 +1,5 @@
 from __future__ import annotations
-import base64, html, threading, time
+import base64, html, logging, threading, time
 from pathlib import Path
 import streamlit as st
 import streamlit.components.v1 as components
@@ -31,8 +31,43 @@ mark{background:#fde68a;color:#111827;border-radius:3px;padding:0 2px}
 @media(max-width:760px){.result{padding:.55rem}}
 </style>""",unsafe_allow_html=True)
 
+_logger=logging.getLogger("ai_search.app")
+
 @st.cache_resource(show_spinner="Načítám významové vyhledávání…")
 def embeddings(): return ai_search.Embeddings()
+
+def _warm_up_embeddings_model():
+    """Forces ai_search.Embeddings' lazy SentenceTransformer(...) load (see
+    its encode()) to happen now, in the background, instead of during the
+    user's first real search - that first search used to pay a one-time
+    ~13s model-load cost (measured on BAAI/bge-m3) on top of the actual
+    query, every other query already runs in ~0.5s once the model is warm.
+
+    Deliberately lives here (app-lifecycle, Streamlit-only) and NOT in
+    ai_search.py/ui_services.py: it changes *when* the model loads, never
+    *what* search()/RRF/reranking/query expansion/indexing do - those all
+    keep calling the same lazy Embeddings.encode() as before, and if this
+    warmup has not finished yet (or failed) a real search still lazy-loads
+    the model exactly as it always has, just without this head start.
+    Failures don't propagate anywhere on purpose: this is a pure
+    optimization, so a broken/offline model must still surface its real
+    error on the user's actual first search, not here - the exception is
+    only logged, via the same `logging.getLogger("ai_search.<module>")`
+    convention as ui_services.py's/query_expansion.py's `_logger`, so a
+    persistently failing warmup is at least visible (console/log
+    aggregation, wherever this process's logging is wired up) instead of
+    silently never happening and never being noticed."""
+    try: embeddings().encode(["ai search embedding warmup"])
+    except Exception as exc: _logger.warning("EMBEDDINGS WARMUP: model se nepodařilo předehřát na pozadí (%s); první reálné hledání jej načte lazy jako dřív.",exc,exc_info=True)
+
+def start_embeddings_warmup():
+    """Kicks off _warm_up_embeddings_model() in a background daemon thread,
+    at most once per Streamlit session (see the `st.session_state` guard at
+    the call site) - embeddings() itself is `st.cache_resource`-cached, so
+    the very first thread to actually call `.encode()` (across ALL sessions
+    sharing this server process) does the real ~13s load and every session
+    after that, including this one on later reruns, gets it back instantly."""
+    threading.Thread(target=_warm_up_embeddings_model,name="AI Search embedding warmup",daemon=True).start()
 
 def highlight(text,query):
     safe=html.escape(text)
@@ -113,6 +148,11 @@ settings=load_settings(SETTINGS); summary=index_summary(STATE)
 if not settings.project_root: settings.project_root=indexed_root(STATE)
 st.session_state.setdefault("page","search"); st.session_state.setdefault("visible_results",PAGE_SIZE)
 if "index_message" in st.session_state: st.toast(st.session_state.pop("index_message"))
+# Kicked off once per session, as early in the script as possible, so the
+# background load (see start_embeddings_warmup's docstring) has the most
+# possible head start over the user actually submitting their first query.
+if not st.session_state.get("embeddings_warmup_started"):
+    st.session_state.embeddings_warmup_started=True; start_embeddings_warmup()
 
 with st.sidebar:
     st.title("🔎 AI Search"); st.caption("Lokální hledání v projektových dokumentech")
