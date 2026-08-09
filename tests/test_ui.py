@@ -208,9 +208,28 @@ def test_twenty_plus_results_are_lazy_and_compact(tmp_path,monkeypatch):
     assert any(b.label=="Zobrazit další výsledky" for b in app.button)
 
 def test_no_results_screen(tmp_path,monkeypatch):
+    """search_all() itself found nothing (raw_result_count==0) - distinct from
+    the filtered-to-zero case below, see test_results_removed_by_filters_shows_distinct_message."""
     _mock_ready_ui(monkeypatch,tmp_path,[])
     app=AppTest.from_file(str(APP_PATH),default_timeout=10).run(); app.text_input[0].input("nenalezitelný výraz").run()
-    assert not app.exception and any("Nebyly nalezeny" in warning.value for warning in app.warning)
+    assert not app.exception
+    assert any("nenalezlo žádné dokumenty" in warning.value for warning in app.warning)
+    assert not any("odstraněny aktivními filtry" in warning.value for warning in app.warning)
+
+def test_results_removed_by_filters_shows_distinct_message(tmp_path,monkeypatch):
+    """search_all() DID find a result, but apply_filters() (a real, unmocked
+    call - only search_all is mocked) removes every row because the active
+    'Zdroj' filter doesn't match. The zero-results message must say so
+    explicitly instead of reusing the generic "nothing found" text from
+    test_no_results_screen - the two are different diagnoses (retrieval vs.
+    filter configuration) and need different user actions."""
+    row={"document":"a.pdf","title":"a.pdf","path":str(tmp_path/"a.pdf"),"project":"P","quote":"obsah","score":1.0,"source":"Dokument","date":"2026-08-04","extension":"pdf","author":""}
+    _mock_ready_ui(monkeypatch,tmp_path,[row])
+    app=AppTest.from_file(str(APP_PATH),default_timeout=10).run(); app.text_input[0].input("Pentaflex").run()
+    app.selectbox[0].select("Poznámka").run()  # row's source is "Dokument" - filters it out entirely
+    assert not app.exception
+    assert any("byly odstraněny aktivními filtry" in warning.value for warning in app.warning)
+    assert not any("nenalezlo žádné dokumenty" in warning.value for warning in app.warning)
 
 def test_ui_search_uses_the_configured_query_expansion_branch(tmp_path,monkeypatch):
     """app.py must hand search_all the branch configured in ai_search_config,
