@@ -235,40 +235,141 @@ def test_search_all_flag_on_runs_multiple_searches_and_merges(monkeypatch, tmp_p
     assert "full" in rows[0].get("_mq_sources", ())
 
 
-def test_search_all_merge_keeps_full_query_document_when_scores_compete(monkeypatch, tmp_path):
+def _stub_search_all_env(monkeypatch, tmp_path, fake_search):
     monkeypatch.setattr(ai_search_config, "MULTI_QUERY_RETRIEVAL_ENABLED", True)
     monkeypatch.setattr(ui, "MULTI_QUERY_RETRIEVAL_ENABLED", True)
-
-    def fake_search(query, db_path, lance_dir, embeddings, limit=8, **kwargs):
-        if query == DESIGN_QUERY:
-            return [{
-                "document": "from-full.txt",
-                "path": str(tmp_path / "from-full.txt"),
-                "project": "p",
-                "quote": "full leg",
-                "heading": "",
-                "score": 0.9,
-                "match": {},
-            }]
-        return [{
-            "document": "from-facet.txt",
-            "path": str(tmp_path / "from-facet.txt"),
-            "project": "p",
-            "quote": "facet leg",
-            "heading": "",
-            "score": 0.8,
-            "match": {},
-        }]
-
     monkeypatch.setattr(ui.ai_search, "search", fake_search)
     monkeypatch.setattr(ui, "metadata_for", lambda path, source: {
         "source": source, "extension": ".txt", "date": "", "author": "", "availability": "local",
     })
     monkeypatch.setattr(ui, "state_paths", lambda state_dir, source: (tmp_path / f"{source}.db", tmp_path / source))
     (tmp_path / "Dokument.db").write_text("", encoding="utf-8")
+    return ui.Settings(project_root=str(tmp_path), result_count=10)
 
-    settings = ui.Settings(project_root=str(tmp_path), result_count=10)
+
+def test_q_full_relative_order_is_preserved(monkeypatch, tmp_path):
+    def fake_search(query, db_path, lance_dir, embeddings, limit=8, **kwargs):
+        if query == DESIGN_QUERY:
+            return [
+                {"document": "full-a.txt", "path": str(tmp_path / "full-a.txt"), "project": "p",
+                 "quote": "a", "heading": "", "score": 0.9, "match": {}},
+                {"document": "full-b.txt", "path": str(tmp_path / "full-b.txt"), "project": "p",
+                 "quote": "b", "heading": "", "score": 0.8, "match": {}},
+            ]
+        # Facet noise with higher numeric scores must not reorder Q_full pair.
+        return [
+            {"document": "noise.txt", "path": str(tmp_path / "noise.txt"), "project": "p",
+             "quote": "noise", "heading": "", "score": 5.0, "match": {}},
+            {"document": "full-b.txt", "path": str(tmp_path / "full-b.txt"), "project": "p",
+             "quote": "b-facet", "heading": "", "score": 4.0, "match": {}},
+        ]
+
+    settings = _stub_search_all_env(monkeypatch, tmp_path, fake_search)
     rows = ui.search_all(DESIGN_QUERY, settings, tmp_path, embeddings=None, expand_query=False)
     names = [r["document"] for r in rows]
-    assert "from-full.txt" in names
-    assert names[0] == "from-full.txt"  # higher score wins; deterministic sort
+    assert names.index("full-a.txt") < names.index("full-b.txt")
+    assert names[0] == "full-a.txt"
+    assert names[1] == "full-b.txt"
+
+
+def test_facet_only_higher_score_cannot_outrank_q_full(monkeypatch, tmp_path):
+    def fake_search(query, db_path, lance_dir, embeddings, limit=8, **kwargs):
+        if query == DESIGN_QUERY:
+            return [{
+                "document": "from-full.txt", "path": str(tmp_path / "from-full.txt"), "project": "p",
+                "quote": "full leg", "heading": "", "score": 0.2, "match": {},
+            }]
+        return [{
+            "document": "from-facet.txt", "path": str(tmp_path / "from-facet.txt"), "project": "p",
+            "quote": "facet leg", "heading": "", "score": 9.9, "match": {},
+        }]
+
+    settings = _stub_search_all_env(monkeypatch, tmp_path, fake_search)
+    rows = ui.search_all(DESIGN_QUERY, settings, tmp_path, embeddings=None, expand_query=False)
+    names = [r["document"] for r in rows]
+    assert names[0] == "from-full.txt"
+    assert "from-facet.txt" in names
+    assert names.index("from-full.txt") < names.index("from-facet.txt")
+
+
+def test_full_plus_action_same_document_keeps_full_rank_and_provenance(monkeypatch, tmp_path):
+    def fake_search(query, db_path, lance_dir, embeddings, limit=8, **kwargs):
+        if query == DESIGN_QUERY:
+            return [
+                {"document": "shared.xls", "path": str(tmp_path / "shared.xls"), "project": "p",
+                 "quote": "full quote", "heading": "", "score": 0.4, "match": {}},
+                {"document": "other-full.txt", "path": str(tmp_path / "other-full.txt"), "project": "p",
+                 "quote": "other", "heading": "", "score": 0.3, "match": {}},
+            ]
+        return [{
+            "document": "shared.xls", "path": str(tmp_path / "shared.xls"), "project": "p",
+            "quote": "action quote", "heading": "", "score": 8.0, "match": {},
+        }]
+
+    settings = _stub_search_all_env(monkeypatch, tmp_path, fake_search)
+    rows = ui.search_all(DESIGN_QUERY, settings, tmp_path, embeddings=None, expand_query=False)
+    shared = [r for r in rows if r["document"] == "shared.xls"]
+    assert len(shared) == 1
+    assert rows[0]["document"] == "shared.xls"
+    assert rows[0]["_mq_sources"][0] == "full"
+    assert "action" in rows[0]["_mq_sources"] or "object_location" in rows[0]["_mq_sources"]
+    # Facet score must not promote shared ahead of its Q_full-relative place:
+    # shared stays before other-full (0.4 > 0.3 on full leg).
+    assert rows[1]["document"] == "other-full.txt"
+
+
+def test_facet_only_fills_when_q_full_underfills_result_count(monkeypatch, tmp_path):
+    def fake_search(query, db_path, lance_dir, embeddings, limit=8, **kwargs):
+        if query == DESIGN_QUERY:
+            return [{
+                "document": "only-full.txt", "path": str(tmp_path / "only-full.txt"), "project": "p",
+                "quote": "full", "heading": "", "score": 0.5, "match": {},
+            }]
+        return [
+            {"document": "facet-1.txt", "path": str(tmp_path / "facet-1.txt"), "project": "p",
+             "quote": "f1", "heading": "", "score": 0.9, "match": {}},
+            {"document": "facet-2.txt", "path": str(tmp_path / "facet-2.txt"), "project": "p",
+             "quote": "f2", "heading": "", "score": 0.8, "match": {}},
+        ]
+
+    settings = _stub_search_all_env(monkeypatch, tmp_path, fake_search)
+    settings.result_count = 3
+    rows = ui.search_all(DESIGN_QUERY, settings, tmp_path, embeddings=None, expand_query=False)
+    assert len(rows) == 3
+    assert rows[0]["document"] == "only-full.txt"
+    assert {r["document"] for r in rows[1:]} == {"facet-1.txt", "facet-2.txt"}
+
+
+def test_facet_discovery_document_can_appear(monkeypatch, tmp_path):
+    def fake_search(query, db_path, lance_dir, embeddings, limit=8, **kwargs):
+        if query == DESIGN_QUERY:
+            return [{
+                "document": "full.txt", "path": str(tmp_path / "full.txt"), "project": "p",
+                "quote": "full", "heading": "", "score": 1.0, "match": {},
+            }]
+        return [{
+            "document": "new-from-facet.txt", "path": str(tmp_path / "new-from-facet.txt"), "project": "p",
+            "quote": "discovered", "heading": "", "score": 0.1, "match": {},
+        }]
+
+    settings = _stub_search_all_env(monkeypatch, tmp_path, fake_search)
+    rows = ui.search_all(DESIGN_QUERY, settings, tmp_path, embeddings=None, expand_query=False)
+    assert any(r["document"] == "new-from-facet.txt" for r in rows)
+    assert rows[0]["document"] == "full.txt"
+
+
+def test_merge_tie_break_is_deterministic_by_path(monkeypatch, tmp_path):
+    def fake_search(query, db_path, lance_dir, embeddings, limit=8, **kwargs):
+        if query != DESIGN_QUERY:
+            return []
+        return [
+            {"document": "b.txt", "path": str(tmp_path / "b.txt"), "project": "p",
+             "quote": "b", "heading": "", "score": 0.5, "match": {}},
+            {"document": "a.txt", "path": str(tmp_path / "a.txt"), "project": "p",
+             "quote": "a", "heading": "", "score": 0.5, "match": {}},
+        ]
+
+    settings = _stub_search_all_env(monkeypatch, tmp_path, fake_search)
+    first = [r["document"] for r in ui.search_all(DESIGN_QUERY, settings, tmp_path, embeddings=None, expand_query=False)]
+    second = [r["document"] for r in ui.search_all(DESIGN_QUERY, settings, tmp_path, embeddings=None, expand_query=False)]
+    assert first == second == ["a.txt", "b.txt"]

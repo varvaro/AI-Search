@@ -45,6 +45,78 @@ def _multi_query_search_plan(query: str, fetch_limit: int) -> list[tuple[str, st
         legs.append((subquery.id, subquery.text, limit))
     return legs or [("full", query, fetch_limit)]
 
+
+def _score_sort_key(row: dict) -> tuple:
+    """Deterministic ranking key: higher score first, then stable path/name."""
+    return (-float(row.get("score") or 0.0), str(row.get("path") or ""), str(row.get("document") or ""))
+
+
+def _merge_multi_query_documents(output: list[dict], is_question: bool) -> tuple[list[dict], list[dict]]:
+    """Path-merge multi-query rows with Q_full as the ranking anchor.
+
+    Root cause this addresses: facet-leg BM25/RRF scores are not comparable to
+    Q_full scores. Sorting every path by raw max(score) let short ACTION queries
+    promote facet-only noise above documents Q_full already ranked.
+
+    Policy (deterministic, no new scoring formula):
+      * If a path appears on Q_full, the base row and ranking score come from
+        the best Q_full hit; facet hits only contribute quote text + provenance.
+      * Facet-only paths keep their own best facet score for relative order
+        among themselves, but are returned in a separate list so callers can
+        place them after all Q_full documents.
+    Returns (full_docs_sorted, facet_only_sorted).
+    """
+    by_path: dict[str, list[dict]] = {}
+    for row in output:
+        by_path.setdefault(row["path"], []).append(row)
+
+    full_docs: list[dict] = []
+    facet_only: list[dict] = []
+    for path, rows in by_path.items():
+        full_rows = [row for row in rows if row.get("_mq_source") == "full"]
+        ranking_rows = full_rows if full_rows else rows
+        base = dict(max(ranking_rows, key=_score_sort_key))
+
+        sources: list[str] = []
+        for row in rows:
+            source_id = row.get("_mq_source")
+            if source_id and source_id not in sources:
+                sources.append(source_id)
+        if "full" in sources:
+            sources = ["full"] + [source_id for source_id in sources if source_id != "full"]
+        base["_mq_sources"] = tuple(sources)
+        base.pop("_mq_source", None)
+
+        # Richer quotes may include facet legs; ranking scores may not.
+        all_quotes = [
+            row["quote"]
+            for row in sorted(rows, key=_score_sort_key)
+            if row.get("quote")
+        ]
+        rank_quotes: list[str] = []
+        rank_scores: list[float] = []
+        for row in sorted(ranking_rows, key=_score_sort_key):
+            if row.get("quote"):
+                rank_quotes.append(row["quote"])
+                rank_scores.append(float(row["score"]))
+
+        quote, evidence = _merge_quote_chunks(all_quotes or rank_quotes)
+        base["quote"] = quote
+        if evidence:
+            base["evidence"] = evidence
+        base["best_chunk_score"] = float(base["score"])
+        if not is_question and rank_scores:
+            base["score"] = _document_evidence_score(rank_scores[0], rank_scores, rank_quotes)
+
+        if "full" in base["_mq_sources"]:
+            full_docs.append(base)
+        else:
+            facet_only.append(base)
+
+    full_docs.sort(key=_score_sort_key)
+    facet_only.sort(key=_score_sort_key)
+    return full_docs, facet_only
+
 @dataclass
 class Settings:
     project_root: str = ""
@@ -392,9 +464,9 @@ def search_all(query: str, settings: Settings, state_dir: Path, embeddings, is_q
     fetch_limit=max(50,candidate_pool*4,ai_search.QA_RERANK_POOL_SIZE) if is_question else max(50,candidate_pool*4)
     # PR2 multi-query: default OFF → one ("full", query, fetch_limit) leg, same
     # as the historical single search() call per source. When gated ON, extra
-    # facet legs reuse ai_search.search() with a smaller fetch budget; path
-    # merge below still collapses to one row per document by best score (no
-    # new facet-coverage scoring in this PR).
+    # facet legs reuse ai_search.search() with a smaller fetch budget; merge
+    # then anchors ranking on Q_full and appends facet-only discovery docs
+    # (scores from different legs are not globally comparable).
     search_legs=_multi_query_search_plan(query, fetch_limit)
     # Provenance fields are only attached when more than Q_full ran, so the
     # default-OFF single-leg path mutates search() rows exactly as before.
@@ -409,6 +481,19 @@ def search_all(query: str, settings: Settings, state_dir: Path, embeddings, is_q
                     row=dict(row)
                     row["_mq_source"]=subquery_id
                 row.update(metadata_for(Path(row["path"]),source)); row["title"]=row.get("title",row["document"]); output.append(row)
+
+    diversify_pool=candidate_pool if is_question else max(candidate_pool,QA_CANDIDATE_POOL)
+
+    if multi_active:
+        full_docs, facet_only = _merge_multi_query_documents(output, is_question=is_question)
+        # Keep Q_full and facet-only pipelines separate through dedup/diversify
+        # so folder caps cannot admit a facet-only row ahead of a Q_full row.
+        full_pool = full_docs[:diversify_pool]
+        facet_pool = facet_only[: max(0, diversify_pool - len(full_pool))]
+        full_part = diversify_results(deduplicate_by_content(full_pool)) if full_pool else []
+        facet_part = diversify_results(deduplicate_by_content(facet_pool)) if facet_pool else []
+        return (full_part + facet_part)[:settings.result_count]
+
     # Path-merge: one output row per document, carrying the BEST-scored chunk's
     # row as the base (so score/match/heading/title are unaffected by this
     # step - identical to before this fix) while its `quote` is built from
@@ -418,15 +503,11 @@ def search_all(query: str, settings: Settings, state_dir: Path, embeddings, is_q
     # replaces). `chunks_by_path` collects quotes in the same relevance order
     # `unique`'s winning row was picked in, since both loop over the same
     # score-descending `sorted(output, ...)` sequence.
-    unique={}; chunks_by_path={}; scores_by_path={}; mq_sources_by_path={}
+    unique={}; chunks_by_path={}; scores_by_path={}
     for row in sorted(output,key=lambda item:item["score"],reverse=True):
         path=row["path"]
         if path not in unique:
-            unique[path]=row; chunks_by_path[path]=[]; scores_by_path[path]=[]; mq_sources_by_path[path]=[]
-        if multi_active:
-            source_id=row.get("_mq_source")
-            if source_id and source_id not in mq_sources_by_path[path]:
-                mq_sources_by_path[path].append(source_id)
+            unique[path]=row; chunks_by_path[path]=[]; scores_by_path[path]=[]
         # Both lists are appended under the SAME condition, so index i of one
         # always describes the same chunk as index i of the other -
         # _document_evidence_score() relies on that alignment.
@@ -435,11 +516,6 @@ def search_all(query: str, settings: Settings, state_dir: Path, embeddings, is_q
         quote,evidence=_merge_quote_chunks(chunks_by_path[path])
         row["quote"]=quote
         if evidence: row["evidence"]=evidence
-        if multi_active:
-            sources=mq_sources_by_path.get(path) or []
-            if sources:
-                row["_mq_sources"]=tuple(sources)
-            row.pop("_mq_source", None)
         # Document-level evidence aggregation (see _document_evidence_score).
         # `best_chunk_score` preserves the pre-aggregation value the row was
         # selected by - kept for diagnostics/benchmark inspection, and it is
@@ -477,7 +553,6 @@ def search_all(query: str, settings: Settings, state_dir: Path, embeddings, is_q
     # later, less aggressive cut of data already in hand. The FINAL page
     # size handed to the caller is still exactly settings.result_count,
     # unchanged, on the last line below.
-    diversify_pool=candidate_pool if is_question else max(candidate_pool,QA_CANDIDATE_POOL)
     candidates=sorted(unique.values(),key=lambda item:item["score"],reverse=True)[:diversify_pool]
     diversified=diversify_results(deduplicate_by_content(candidates))
     return diversified[:settings.result_count]
