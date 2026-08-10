@@ -19,7 +19,11 @@ from benchmark.dataset.schema import BenchmarkCase, load_dataset
 from benchmark.environment import Environment
 
 DATASET = suite.DATASET_PATH
-EXPECTED_CASE_COUNT = 20
+EXPECTED_CASE_COUNT = 21
+# Case added to the dataset as a known-limitation tripwire before the next
+# baseline refresh (user-requested: do not update baseline in the same change).
+# test_checked_in_baseline_matches_the_dataset accounts for this gap explicitly.
+PENDING_BASELINE_CASE_IDS = frozenset({"rr-bp-vyvody-3pp-01"})
 
 
 @pytest.fixture(scope="module")
@@ -75,12 +79,17 @@ def test_corrected_ground_truth_is_the_one_actually_shipped(cases):
     assert not any("VT 11" in needle for needle in by_id["rr-haus365-tp-monolit-01"].expected_documents)
 
 
-def test_the_two_known_limitations_are_flagged(cases):
+def test_the_known_limitations_are_flagged(cases):
     by_id = {case.id: case for case in cases}
     assert by_id["rr-haus365-kladecsky-plan-01"].expected_content_missing is True
     assert by_id["rr-kzp-monolit-feri-01"].expected_retrieval_issue is True
+    assert by_id["rr-bp-vyvody-3pp-01"].expected_retrieval_issue is True
     flagged = [c.id for c in cases if c.expected_content_missing or c.expected_retrieval_issue]
-    assert sorted(flagged) == ["rr-haus365-kladecsky-plan-01", "rr-kzp-monolit-feri-01"]
+    assert sorted(flagged) == [
+        "rr-bp-vyvody-3pp-01",
+        "rr-haus365-kladecsky-plan-01",
+        "rr-kzp-monolit-feri-01",
+    ]
 
 
 # --- schema: new fields are additive ----------------------------------------
@@ -274,11 +283,18 @@ def test_run_artifact_records_the_expansion_mode_it_was_measured_under():
 
 def test_checked_in_baseline_matches_the_dataset(cases):
     """Catches a dataset edited without refreshing the baseline, which would
-    otherwise show up as a pile of NEW/removed entries in the next report."""
+    otherwise show up as a pile of NEW/removed entries in the next report.
+
+    PENDING_BASELINE_CASE_IDS are intentionally allowed as the sole gap: the
+    case is already in the dataset (so the tripwire is live) while the
+    committed baseline has not been refreshed yet."""
     baseline = json.loads(suite.BASELINE_PATH.read_text(encoding="utf-8"))
-    assert {c["id"] for c in baseline["cases"]} == {c.id for c in cases}
+    dataset_ids = {c.id for c in cases}
+    baseline_ids = {c["id"] for c in baseline["cases"]}
+    assert baseline_ids == dataset_ids - PENDING_BASELINE_CASE_IDS
+    assert dataset_ids - baseline_ids == PENDING_BASELINE_CASE_IDS
     assert baseline["environment"]["index_fingerprint"]
-    assert baseline["aggregate"]["case_count"] == EXPECTED_CASE_COUNT
+    assert baseline["aggregate"]["case_count"] == EXPECTED_CASE_COUNT - len(PENDING_BASELINE_CASE_IDS)
 
 
 def test_the_committed_baseline_carries_no_real_document_paths():

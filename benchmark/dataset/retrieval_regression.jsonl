@@ -1,5 +1,6 @@
-# Retrieval regression suite - 20 production lookups, one per real failure mode
-# found during the 2026-08-06/07 diagnostics. Run it with:
+# Retrieval regression suite - 21 production lookups, one per real failure mode
+# found during the 2026-08-06/07 diagnostics (plus later vocabulary-mismatch
+# tripwires such as rr-bp-vyvody-3pp-01). Run it with:
 #
 #     python -m benchmark.run_retrieval_regression
 #
@@ -49,3 +50,4 @@
 {"id": "rr-prefakturace-gd-zg-01", "domain": "fakturace", "question": "přefakturace nákladů GD na ZG", "type": "lookup", "difficulty": "medium", "environment": "production", "expected_documents": ["přefakturace nákladů GD"], "tags": ["retrieval-regression"], "notes": "3 documents - the re-invoicing statement and its revisions."}
 {"id": "rr-predavaci-protokol-zg-01", "domain": "předání dokumentace", "question": "předávací protokol Zakládání Group staveniště", "type": "lookup", "difficulty": "medium", "environment": "production", "expected_documents": ["Predavaci_protokol_Zakladani_Group"], "tags": ["retrieval-regression", "truncation"], "notes": "1 document. This is the case that exposed the post-rerank truncation bug in ui_services.search_all(): it sat at pool rank 11 and the pre-fix [:result_count] cut discarded it before dedup/diversify ran. A MISS here means that truncation ordering regressed. A bare 'Zakládání Group' needle matched 217 documents and is not usable."}
 {"id": "rr-email-feri-terminy-01", "domain": "e-maily", "question": "e-mail FERI závazné termíny SoD monolit", "type": "lookup", "difficulty": "easy", "environment": "production", "expected_documents": ["závazné termíny"], "tags": ["retrieval-regression", "eml"], "notes": "1 document (.eml). Only e-mail case in the suite - covers that .eml extraction still reaches the index."}
+{"id": "rr-bp-vyvody-3pp-01", "domain": "BP", "question": "půdorys 3PP bludné proudy", "type": "lookup", "difficulty": "hard", "environment": "production", "expected_documents": ["D.1.4.j.3_03_3.PP"], "expected_retrieval_issue": true, "tags": ["retrieval-regression", "known-limitation", "vocabulary-mismatch"], "notes": "1 document (D.1.4.j.3_03_3.PP.pdf), indexed (20 chunks). Diagnosed vocabulary mismatch: the user query uses the human construction phrase 'bludné proudy' / 'půdorys 3PP', while the drawing is filed under the project code D.1.4.j (folder name carries 'Bludné proudy') and its extracted title reads 'Vývody 3.PP' with '3.PP' in body text - the abbreviation BP and the words 'bludné proudy' do not appear in chunk text. Measured 2026-08-10: search_all top-10 MISS, ai_search.search(limit=50) rank #15. Kept as a tripwire for a future abbreviation/expansion fix; MISS must not fail the suite on its own."}
