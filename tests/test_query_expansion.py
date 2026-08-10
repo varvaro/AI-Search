@@ -426,3 +426,60 @@ def test_two_documents_sharing_the_abbreviation_keep_their_relative_order(kzp_in
         rows = ai_search.search(query, db, lance, embeddings, limit=10, expand_query=expand_query)
         documents = [r["document"] for r in rows]
         assert documents.index("KZP silny.txt") < documents.index("KZP slaby.txt"), f"order changed for expand_query={expand_query!r}"
+
+
+# ---------------------------------------------------------------------------
+# Query Expansion 2.0 MVP - floor notation + bludné proudy → D.1.4.j
+# (rr-bp-vyvody-3pp-01). No scoring/RRF changes; dictionary + normalizer only.
+# ---------------------------------------------------------------------------
+
+def test_bludne_proudy_emits_project_part_code_not_short_abbreviation():
+    """Human phrase must bridge to the project part code used in paths/names.
+    Must NOT emit bare "BP" (2-char abbr false-positive class)."""
+    expansion = qe.expand_query("bludné proudy")
+    assert "D.1.4.j" in expansion.terms
+    assert "BP" not in expansion.terms
+    assert all(qe._fold(term) != "bp" for term in expansion.terms)
+    assert any(rule["key"] == "bludné proudy" for rule in expansion.matched_rules)
+
+
+def test_floor_pp_normalization_emits_dotted_form_from_compact_query():
+    """'3PP' in the query must produce the dotted drawing form '3.PP' so FTS
+    can hit body/filename text tokenized as ('3','PP')."""
+    expansion = qe.expand_query("půdorys 3PP bludné proudy")
+    assert "3.PP" in expansion.terms
+    assert "D.1.4.j" in expansion.terms
+    assert len(expansion.terms) <= qe.MAX_EXPANSION_TERMS
+
+
+def test_floor_pp_normalization_covers_spaced_and_dotted_inputs():
+    """Dotted and spaced forms already share FTS tokens ('3','PP'), so the
+    bridge they still need is the compact single-token '3PP' used in some
+    filenames/queries. Compact '3PP' is covered by the previous test."""
+    assert "3PP" in qe.expand_query("půdorys 3.PP").terms
+    assert "3PP" in qe.expand_query("půdorys 3 PP").terms
+
+
+def test_bare_bp_does_not_expand():
+    """A lone 'BP' query must not fire the bludné proudy rule or emit D.1.4.j -
+    short abbreviations are too ambiguous without the full human phrase."""
+    expansion = qe.expand_query("BP")
+    assert expansion.terms == []
+    assert expansion.matched_rules == []
+    assert not qe.expand_query("bp")
+
+
+def test_qe2_mvp_does_not_worsen_short_abbreviation_filename_gating():
+    """TP/ZL stay below ABBREVIATION_FILENAME_MIN_LENGTH; KD likewise must not
+    become a filename needle. KZP (≥3 chars) remains eligible."""
+    tp = qe.expand_query("technologický postup")
+    zl = qe.expand_query("změnový list")
+    kd = qe.expand_query("kontrolní den")
+    kzp = qe.expand_query("kontrolní a zkušební plán")
+    assert ai_search._abbreviation_filename_needles(tp) == set()
+    assert ai_search._abbreviation_filename_needles(zl) == set()
+    assert ai_search._abbreviation_filename_needles(kd) == set()
+    assert ai_search._abbreviation_filename_needles(kzp) == {"kzp"}
+    # bludné proudy emits a code, not an abbreviations-category term
+    bp = qe.expand_query("bludné proudy")
+    assert ai_search._abbreviation_filename_needles(bp) == set()

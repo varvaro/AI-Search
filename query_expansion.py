@@ -193,6 +193,15 @@ CONSTRUCTION_VOCABULARY: dict[str, dict] = {
         "synonyms": ["závada", "nedodělek", "reklamace"],
         "documents": ["seznam vad a nedodělků", "protokol o odstranění vad", "reklamační protokol"],
     },
+    # Query Expansion 2.0 MVP: human phrase "bludné proudy" vs project part code
+    # D.1.4.j used in filenames/folders (rr-bp-vyvody-3pp-01). Emit the CODE, not
+    # the 2-letter abbreviation "BP" - short abbrs (BP/TP/ZL/KD) historically
+    # flooded FTS/filename matching with false positives. "BP" is intentionally
+    # absent from abbreviations/synonyms so a bare "BP" query never triggers this.
+    "bludné proudy": {
+        "scope": "discipline",
+        "documents": ["D.1.4.j"],
+    },
 }
 
 # --- Deployment-specific project aliases ------------------------------------
@@ -233,6 +242,46 @@ def _fold(text: str) -> str:
 
 def _tokens(text: str) -> list[str]:
     return re.findall(r"\w+", _fold(text))
+
+
+# Floor / storey notation: users type "3PP", drawings and filenames often use
+# "3.PP" or "3 PP". FTS tokenizes on non-word chars, so "3PP" (one token) does
+# not match "3.PP" (tokens "3","PP") without an explicit bridge. Match every
+# NPP / N.PP / N PP form in the query and emit the missing siblings as
+# expansion terms - pure notation aliases, not domain synonyms.
+_FLOOR_PP_PATTERN = re.compile(r"(?<!\w)(\d+)\s*\.?\s*pp(?!\w)", re.IGNORECASE)
+
+
+def _floor_pp_forms(level: str) -> tuple[str, str, str]:
+    """Canonical alternate spellings for one floor level number."""
+    return (f"{level}PP", f"{level}.PP", f"{level} PP")
+
+
+def _floor_level_expansion_terms(query: str) -> list[str]:
+    """Return floor-notation variants present in spirit but not yet usable as
+    FTS bridges for `query`. Empty when the query names no NPP/N.PP/N PP form.
+    Deterministic and order-stable: ascending level, then (NPP, N.PP, N PP).
+    "3.PP" and "3 PP" share the same FTS tokens, so only the first surviving
+    form per token-set is kept (prefers dotted "N.PP" over spaced "N PP")."""
+    present = set(_tokens(query))
+    selected: list[str] = []
+    seen_levels: set[str] = set()
+    seen_token_sets: set[frozenset[str]] = set()
+    for match in _FLOOR_PP_PATTERN.finditer(query or ""):
+        level = match.group(1)
+        if level in seen_levels:
+            continue
+        seen_levels.add(level)
+        for form in _floor_pp_forms(level):
+            form_tokens = set(_tokens(form))
+            if not form_tokens or form_tokens <= present:
+                continue
+            token_key = frozenset(form_tokens)
+            if token_key in seen_token_sets:
+                continue
+            seen_token_sets.add(token_key)
+            selected.append(form)
+    return selected
 
 
 def _surface_matches(surface: str, query_tokens: list[str]) -> bool:
@@ -301,6 +350,20 @@ def expand_query(query: str, vocabulary: dict[str, dict] | None = None, max_term
     present = set(query_tokens)
     matched: list[dict] = []
     streams: list[list[str]] = []
+
+    # Floor notation bridges first: tiny, high-precision, and they must not lose
+    # the MAX_EXPANSION_TERMS race to a multi-rule domain match on the same query
+    # (e.g. "půdorys 3PP bludné proudy" needs both 3.PP and D.1.4.j).
+    floor_terms = _floor_level_expansion_terms(query)
+    if floor_terms:
+        matched.append({
+            "key": "floor_level_pp",
+            "scope": "notation",
+            "trigger": "floor_pp",
+            "terms": list(floor_terms),
+        })
+        streams.append(list(floor_terms))
+
     for key, rule in vocab.items():
         triggers = [key] + [surface for category in TRIGGER_CATEGORIES for surface in rule.get(category, ())]
         trigger = next((surface for surface in triggers if _surface_matches(surface, query_tokens)), None)
