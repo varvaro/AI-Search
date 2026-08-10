@@ -19,11 +19,14 @@ from benchmark.dataset.schema import BenchmarkCase, load_dataset
 from benchmark.environment import Environment
 
 DATASET = suite.DATASET_PATH
-EXPECTED_CASE_COUNT = 21
-# Case added to the dataset as a known-limitation tripwire before the next
-# baseline refresh (user-requested: do not update baseline in the same change).
+EXPECTED_CASE_COUNT = 22
+# Cases added to the dataset as tripwires before the next baseline refresh
+# (user-requested: do not update baseline in the same change).
 # test_checked_in_baseline_matches_the_dataset accounts for this gap explicitly.
-PENDING_BASELINE_CASE_IDS = frozenset({"rr-bp-vyvody-3pp-01"})
+PENDING_BASELINE_CASE_IDS = frozenset({
+    "rr-bp-vyvody-3pp-01",
+    "rr-brokovani-zakladova-deska-3pp-01",
+})
 
 
 @pytest.fixture(scope="module")
@@ -84,6 +87,8 @@ def test_the_known_limitations_are_flagged(cases):
     assert by_id["rr-haus365-kladecsky-plan-01"].expected_content_missing is True
     assert by_id["rr-kzp-monolit-feri-01"].expected_retrieval_issue is True
     assert by_id["rr-bp-vyvody-3pp-01"].expected_retrieval_issue is True
+    # brokování tripwire is a normal blocking case after the QE surface-prep fix
+    assert by_id["rr-brokovani-zakladova-deska-3pp-01"].expected_retrieval_issue is False
     flagged = [c.id for c in cases if c.expected_content_missing or c.expected_retrieval_issue]
     assert sorted(flagged) == [
         "rr-bp-vyvody-3pp-01",

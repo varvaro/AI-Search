@@ -483,3 +483,59 @@ def test_qe2_mvp_does_not_worsen_short_abbreviation_filename_gating():
     # bludné proudy emits a code, not an abbreviations-category term
     bp = qe.expand_query("bludné proudy")
     assert ai_search._abbreviation_filename_needles(bp) == set()
+
+
+# ---------------------------------------------------------------------------
+# Surface preparation: brokování/brokovat → otryskání (+ broušení)
+# (rr-brokovani-zakladova-deska-3pp-01). QE-only; no scoring/RRF changes.
+# ---------------------------------------------------------------------------
+
+def test_brokovat_zakladova_deska_emits_otryskani_and_keeps_floor_normalization():
+    expansion = qe.expand_query("bude se brokovat základová deska 3PP")
+    assert "otryskání" in expansion.terms
+    assert "broušení" in expansion.terms
+    assert "3.PP" in expansion.terms
+    assert any(rule["key"] == "brokování" for rule in expansion.matched_rules)
+    assert len(expansion.terms) <= qe.MAX_EXPANSION_TERMS
+
+
+def test_brokovani_podkladu_emits_otryskani():
+    expansion = qe.expand_query("brokování podkladu")
+    assert "otryskání" in expansion.terms
+    assert "broušení" in expansion.terms
+
+
+def test_brokovat_beton_emits_otryskani():
+    expansion = qe.expand_query("brokovat beton")
+    assert "otryskání" in expansion.terms
+    assert "broušení" in expansion.terms
+
+
+def test_brokovani_morphology_covers_instrumental_without_stemmer():
+    """Prefix match on the rule key covers common declension (brokováním).
+    Participles like brokovaný are out of scope (no Czech stemmer)."""
+    assert "otryskání" in qe.expand_query("brokováním").terms
+    assert "otryskání" not in qe.expand_query("brokovaný").terms
+
+
+def test_surface_prep_rule_does_not_change_existing_abbreviation_expansions():
+    """BP/TP/ZL/KD/KZP expansion contracts stay intact beside the new rule."""
+    bp = qe.expand_query("bludné proudy")
+    assert "D.1.4.j" in bp.terms
+    assert "BP" not in bp.terms
+
+    tp = qe.expand_query("technologický postup")
+    assert "TP" in tp.terms
+
+    zl = qe.expand_query("změnový list")
+    assert "ZL" in zl.terms
+
+    kd = qe.expand_query("kontrolní den")
+    assert "KD" in kd.terms
+
+    kzp = qe.expand_query("kontrolní a zkušební plán")
+    assert "KZP" in kzp.terms
+
+    # Bare "BP" stays inert (not an abbreviations trigger). TP/ZL/KD remain
+    # legitimate abbreviation keys and may still expand - that is unchanged.
+    assert qe.expand_query("BP").terms == []

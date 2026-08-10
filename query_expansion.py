@@ -202,6 +202,27 @@ CONSTRUCTION_VOCABULARY: dict[str, dict] = {
         "scope": "discipline",
         "documents": ["D.1.4.j"],
     },
+    # Surface-preparation synonymy (rr-brokovani-zakladova-deska-3pp-01): site
+    # language says "brokovat/brokování" while bills of quantities and supplier
+    # VV sheets title the same process as "otryskání" and list the techniques
+    # side by side (corpus: "Otryskání podkladu … brokování, broušení").
+    # Both emits are under `documents` (emit-only) so a query that already says
+    # otryskání/broušení is not dragged sideways into brokování expansions.
+    # A/B on the production index (2026-08-10): emit "otryskání" alone or with
+    # "otryskání podkladu" enters the BM25 pool but still misses search_all
+    # top-10; adding the co-listed technique "broušení" reaches top-10 without
+    # a construction-context gate and without suite regressions. Only
+    # "brokovat" is listed as a synonym trigger - multi-word elaborations
+    # ("brokování podkladu/betonu") still match via the key token alone, and
+    # listing them as synonyms would re-emit those phrases into FTS and dilute
+    # the rare-term signal again. Czech declension of the key ("brokováním")
+    # is covered by MIN_PREFIX_MATCH_LENGTH prefix matching; "brokovat" cannot
+    # prefix-match "brokování", so it must be an explicit synonym.
+    "brokování": {
+        "scope": "construction_process",
+        "synonyms": ["brokovat"],
+        "documents": ["otryskání", "broušení"],
+    },
 }
 
 # --- Deployment-specific project aliases ------------------------------------
