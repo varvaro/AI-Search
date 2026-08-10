@@ -50,4 +50,15 @@ EMBEDDING_BATCH_SIZE = 8
 # always measures the same path the UI takes - a constant here rather than a
 # literal at each call site is what keeps those two from drifting apart.
 QUERY_EXPANSION_MODE = "fts"
+# Multi-Document Retrieval PR2: gated multi-query orchestration inside
+# ui_services.search_all(). Default OFF keeps the single-query path byte-identical
+# to pre-PR2 behaviour (verified against the retrieval regression suite).
+# When True, search_all may run up to MAX_SUBQUERIES facet subqueries for
+# multi-concept queries only (see query_facets.should_use_multi_query).
+MULTI_QUERY_RETRIEVAL_ENABLED = False
+MAX_SUBQUERIES = 4
+# Per-facet subquery fetch budget (chunk rows from ai_search.search). Q_full
+# still uses search_all's normal fetch_limit; facet legs stay smaller so
+# MAX_SUBQUERIES cannot multiply the QA 500-pool.
+MULTI_QUERY_FACET_FETCH_LIMIT = 30
 MSG_PARSE_TIMEOUT_SECONDS = 120

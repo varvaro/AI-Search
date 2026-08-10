@@ -1,12 +1,15 @@
-"""Deterministic query facet extraction (Multi-Document Retrieval PR1).
+"""Deterministic query facet extraction + multi-query planning (PR1/PR2).
 
-Pure decomposition of a user query into typed facets. This module does NOT
-expand queries, call retrieval, touch SQLite/LanceDB, or invoke an LLM.
+Pure decomposition of a user query into typed facets, plus a deterministic
+subquery planner used by gated multi-query retrieval:
 
     query → extract_facets(query) → list[QueryFacet]
+         → should_use_multi_query / plan_subqueries
 
-PR2+ may build subqueries from these facets. Until then nothing in the
-runtime search path imports this module.
+This module does NOT expand queries, call retrieval, touch SQLite/LanceDB,
+or invoke an LLM. Expansion still happens inside ai_search.search() via the
+existing query_expansion path when ui_services.search_all() runs each planned
+subquery.
 
 Matching reuses the same fold/prefix principles as query_expansion.py so
 Czech declension behaves consistently, but facet typing is a separate
@@ -60,6 +63,15 @@ class FacetType(str, Enum):
     DOC_TYPE = "DOC_TYPE"
     ACTOR = "ACTOR"  # reserved; no safe firm dictionary in-repo for PR1 detection
     OTHER = "OTHER"
+
+
+# Facet types that may open the multi-query gate. ACTOR/OTHER never count.
+MULTI_QUERY_GATE_TYPES = frozenset({
+    FacetType.ACTION,
+    FacetType.OBJECT,
+    FacetType.LOCATION,
+    FacetType.DOC_TYPE,
+})
 
 
 @dataclass(frozen=True)
@@ -432,3 +444,100 @@ def extract_facets(query: str) -> list[QueryFacet]:
         facets.sort(key=_start)
 
     return facets
+
+
+@dataclass(frozen=True)
+class PlannedSubquery:
+    """One retrieval leg produced by plan_subqueries().
+
+    `id` is stable (`full`, `action`, `object_location`, `doc_type`).
+    `text` is the string passed to ai_search.search(); QE runs there unchanged.
+    `facet_types` records which facet types contributed (empty for Q_full).
+    """
+
+    id: str
+    text: str
+    facet_types: tuple[FacetType, ...] = ()
+
+
+def should_use_multi_query(facets: list[QueryFacet]) -> bool:
+    """True when facets justify multi-query retrieval.
+
+    Requires ≥2 distinct types from MULTI_QUERY_GATE_TYPES. OTHER/ACTOR never
+    open the gate by themselves and do not count toward the threshold.
+    Pure and deterministic - no I/O, no config flag check (callers combine
+    this with MULTI_QUERY_RETRIEVAL_ENABLED).
+    """
+    types = {facet.type for facet in facets if facet.type in MULTI_QUERY_GATE_TYPES}
+    return len(types) >= 2
+
+
+def _surfaces_for(facets: list[QueryFacet], facet_type: FacetType) -> list[str]:
+    return [facet.surface for facet in facets if facet.type is facet_type and facet.surface.strip()]
+
+
+def plan_subqueries(
+    query: str,
+    facets: list[QueryFacet] | None = None,
+    max_subqueries: int = 4,
+) -> list[PlannedSubquery]:
+    """Build a deterministic subquery plan. Always starts with Q_full.
+
+    Additional legs (action / object_location / doc_type) are appended only
+    when should_use_multi_query(facets) is true and the joined surface text
+    is non-empty and not a duplicate of an earlier leg (including Q_full).
+
+    Does not emit filenames, document ids, or project-specific hacks.
+    Caps at max_subqueries (including Q_full). Pure - no retrieval, no QE.
+    """
+    original = (query or "").strip()
+    if not original:
+        return []
+
+    if facets is None:
+        facets = extract_facets(original)
+
+    # Clamp defensively; config MAX_SUBQUERIES is the production ceiling.
+    limit = max(1, min(int(max_subqueries), 4))
+    planned: list[PlannedSubquery] = [
+        PlannedSubquery(id="full", text=original, facet_types=()),
+    ]
+    seen = {_fold(original)}
+
+    if not should_use_multi_query(facets):
+        return planned[:limit]
+
+    def _add(subquery_id: str, parts: list[str], facet_types: tuple[FacetType, ...]) -> None:
+        if len(planned) >= limit:
+            return
+        text = " ".join(part.strip() for part in parts if part and part.strip()).strip()
+        if not text:
+            return
+        folded = _fold(text)
+        if not folded or folded in seen:
+            return
+        seen.add(folded)
+        planned.append(
+            PlannedSubquery(id=subquery_id, text=text, facet_types=facet_types)
+        )
+
+    action_surfaces = _surfaces_for(facets, FacetType.ACTION)
+    if action_surfaces:
+        _add("action", action_surfaces, (FacetType.ACTION,))
+
+    object_surfaces = _surfaces_for(facets, FacetType.OBJECT)
+    location_surfaces = _surfaces_for(facets, FacetType.LOCATION)
+    object_location = object_surfaces + location_surfaces
+    if object_location:
+        types: list[FacetType] = []
+        if object_surfaces:
+            types.append(FacetType.OBJECT)
+        if location_surfaces:
+            types.append(FacetType.LOCATION)
+        _add("object_location", object_location, tuple(types))
+
+    doc_surfaces = _surfaces_for(facets, FacetType.DOC_TYPE)
+    if doc_surfaces:
+        _add("doc_type", doc_surfaces, (FacetType.DOC_TYPE,))
+
+    return planned[:limit]

@@ -7,9 +7,43 @@ from email.parser import BytesParser
 import base64, difflib, json, logging, os, re, shutil, sqlite3, subprocess, tempfile, time
 from pathlib import Path
 import ai_search
-from ai_search_config import APP_SUPPORT_DIR
+from ai_search_config import (
+    APP_SUPPORT_DIR,
+    MAX_SUBQUERIES,
+    MULTI_QUERY_FACET_FETCH_LIMIT,
+    MULTI_QUERY_RETRIEVAL_ENABLED,
+)
 
 _logger = logging.getLogger("ai_search.ui_services")
+
+
+def _multi_query_search_plan(query: str, fetch_limit: int) -> list[tuple[str, str, int]]:
+    """Resolve (subquery_id, text, limit) legs for search_all.
+
+    When MULTI_QUERY_RETRIEVAL_ENABLED is False (default) or the facet gate
+    does not fire, returns exactly one leg: ("full", query, fetch_limit) -
+    identical to the pre-PR2 single-query path.
+    """
+    if not MULTI_QUERY_RETRIEVAL_ENABLED:
+        return [("full", query, fetch_limit)]
+
+    # Local import keeps the default-OFF path from depending on facets at
+    # module import time and makes monkeypatching in tests straightforward.
+    from query_facets import extract_facets, plan_subqueries, should_use_multi_query
+
+    facets = extract_facets(query)
+    if not should_use_multi_query(facets):
+        return [("full", query, fetch_limit)]
+
+    plan = plan_subqueries(query, facets, max_subqueries=MAX_SUBQUERIES)
+    legs: list[tuple[str, str, int]] = []
+    for subquery in plan:
+        if subquery.id == "full":
+            limit = fetch_limit
+        else:
+            limit = min(fetch_limit, MULTI_QUERY_FACET_FETCH_LIMIT)
+        legs.append((subquery.id, subquery.text, limit))
+    return legs or [("full", query, fetch_limit)]
 
 @dataclass
 class Settings:
@@ -356,12 +390,25 @@ def search_all(query: str, settings: Settings, state_dir: Path, embeddings, is_q
     # audit: a genuinely relevant handover-document chunk ranked #226 of 300 after
     # RRF/rerank, well past a plain 50*4=200 cutoff).
     fetch_limit=max(50,candidate_pool*4,ai_search.QA_RERANK_POOL_SIZE) if is_question else max(50,candidate_pool*4)
+    # PR2 multi-query: default OFF → one ("full", query, fetch_limit) leg, same
+    # as the historical single search() call per source. When gated ON, extra
+    # facet legs reuse ai_search.search() with a smaller fetch budget; path
+    # merge below still collapses to one row per document by best score (no
+    # new facet-coverage scoring in this PR).
+    search_legs=_multi_query_search_plan(query, fetch_limit)
+    # Provenance fields are only attached when more than Q_full ran, so the
+    # default-OFF single-leg path mutates search() rows exactly as before.
+    multi_active=len(search_legs)>1
     roots=[("Dokument",settings.project_root),("E-mail",settings.email_root),("Poznámka",settings.notes_root)]; output=[]
     for source,root in roots:
         db,lance=state_paths(state_dir,source)
         if not root or not db.exists(): continue
-        for row in ai_search.search(query,db,lance,embeddings,fetch_limit,is_question=is_question,expand_query=expand_query):
-            row.update(metadata_for(Path(row["path"]),source)); row["title"]=row.get("title",row["document"]); output.append(row)
+        for subquery_id, subquery_text, subquery_limit in search_legs:
+            for row in ai_search.search(subquery_text,db,lance,embeddings,subquery_limit,is_question=is_question,expand_query=expand_query):
+                if multi_active:
+                    row=dict(row)
+                    row["_mq_source"]=subquery_id
+                row.update(metadata_for(Path(row["path"]),source)); row["title"]=row.get("title",row["document"]); output.append(row)
     # Path-merge: one output row per document, carrying the BEST-scored chunk's
     # row as the base (so score/match/heading/title are unaffected by this
     # step - identical to before this fix) while its `quote` is built from
@@ -371,11 +418,15 @@ def search_all(query: str, settings: Settings, state_dir: Path, embeddings, is_q
     # replaces). `chunks_by_path` collects quotes in the same relevance order
     # `unique`'s winning row was picked in, since both loop over the same
     # score-descending `sorted(output, ...)` sequence.
-    unique={}; chunks_by_path={}; scores_by_path={}
+    unique={}; chunks_by_path={}; scores_by_path={}; mq_sources_by_path={}
     for row in sorted(output,key=lambda item:item["score"],reverse=True):
         path=row["path"]
         if path not in unique:
-            unique[path]=row; chunks_by_path[path]=[]; scores_by_path[path]=[]
+            unique[path]=row; chunks_by_path[path]=[]; scores_by_path[path]=[]; mq_sources_by_path[path]=[]
+        if multi_active:
+            source_id=row.get("_mq_source")
+            if source_id and source_id not in mq_sources_by_path[path]:
+                mq_sources_by_path[path].append(source_id)
         # Both lists are appended under the SAME condition, so index i of one
         # always describes the same chunk as index i of the other -
         # _document_evidence_score() relies on that alignment.
@@ -384,6 +435,11 @@ def search_all(query: str, settings: Settings, state_dir: Path, embeddings, is_q
         quote,evidence=_merge_quote_chunks(chunks_by_path[path])
         row["quote"]=quote
         if evidence: row["evidence"]=evidence
+        if multi_active:
+            sources=mq_sources_by_path.get(path) or []
+            if sources:
+                row["_mq_sources"]=tuple(sources)
+            row.pop("_mq_source", None)
         # Document-level evidence aggregation (see _document_evidence_score).
         # `best_chunk_score` preserves the pre-aggregation value the row was
         # selected by - kept for diagnostics/benchmark inspection, and it is
