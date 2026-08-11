@@ -1414,7 +1414,10 @@ def search(query, db_path, lance_dir, embeddings, limit=8, is_question=False, tr
     rows_by_id={}
     with database(db_path) as con:
         for cid in top_ids:
-            row=con.execute("SELECT d.name,d.path,d.project,c.heading,c.text FROM chunks c JOIN documents d ON d.id=c.document_id WHERE c.id=?",(cid,)).fetchone()
+            # d.id is additive identity for EvidenceSet (PR3); chunk id is `cid`.
+            # Column order of name/path/project/heading/text stays unchanged so
+            # existing row[0]..row[4] consumers (cross-encoder, quote) are untouched.
+            row=con.execute("SELECT d.name,d.path,d.project,c.heading,c.text,d.id FROM chunks c JOIN documents d ON d.id=c.document_id WHERE c.id=?",(cid,)).fetchone()
             if row: rows_by_id[cid]=row
 
     # candidate_strategy="union_ce": score each (query, full_chunk_text) pair
@@ -1457,7 +1460,10 @@ def search(query, db_path, lance_dir, embeddings, limit=8, is_question=False, tr
         score=ce_score_by_id[cid] if ce_score_by_id is not None else rrf_scores[cid]*quality+(FILENAME_MATCH_BONUS if filename_match else ABBREVIATION_FILENAME_MATCH_BONUS if abbreviation_filename_match else 0.0)
         match={"fts_hit":fts_hit,"vector_hit":cid in vector_id_set,"semantic_similarity":max(similarity_by_id.get(cid,0.0),0.0),"filename_match":filename_match,"chunk_quality":quality}
         if ce_score_by_id is not None: match["cross_encoder_score"]=ce_score_by_id[cid]
-        output.append({"document":row[0],"path":row[1],"project":row[2],"quote":row[4][:700],"heading":row[3],"score":score,"match":match})
+        # document_id/chunk_id are additive (EvidenceSet PR3). Ranking/score/
+        # existing public fields are unchanged; callers that only read the
+        # historical keys keep identical behaviour.
+        output.append({"document":row[0],"path":row[1],"project":row[2],"quote":row[4][:700],"heading":row[3],"score":score,"match":match,"document_id":row[5],"chunk_id":cid})
         # Cheap `if` on an already-existing per-candidate DB round trip -
         # negligible next to the SQLite query on the line above; only
         # runs at all when a trace is attached.
