@@ -1,0 +1,11 @@
+# dataset_version: 0.1.0-pr83
+#
+# PR8.3 — OLD revision safety guard (answer-side authority, not ranking).
+# Does not change acceptance_nds_smichov.jsonl.
+#
+{"id": "pr83-status-04-dodavatel", "query": "kdo je dodavatel monolitu?", "type": "factual", "notes": "FAT v2 blocker nds-status-04 — OLD VOP must not be authoritative"}
+{"id": "pr83-signed-contract", "query": "existuje podepsaná smlouva na monolit s FERI?", "type": "factual", "notes": "signed-contract intent must not rest on /old/"}
+{"id": "pr83-existuje-smlouva", "query": "existuje smlouva s FERI?", "type": "factual", "notes": "existuje smlouva forbids OLD authority"}
+{"id": "pr83-aktualni-hmg", "query": "najdi aktuální harmonogram stavby", "type": "lookup", "notes": "aktuální → OLD not authoritative"}
+{"id": "pr83-history-allowed", "query": "porovnání revizí smlouvy FERI", "type": "comparison", "notes": "historie/revize/porovnání may use OLD"}
+{"id": "pr83-old-only-drawing", "query": "existuje výkres výztuže 3.PP?", "type": "lookup", "notes": "nds-status-03 analogue — OLD-only corpus stays visible"}

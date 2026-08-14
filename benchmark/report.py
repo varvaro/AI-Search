@@ -251,6 +251,20 @@ def write_reports(run: dict, out_dir: Path, comparison: dict | None = None) -> d
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     written = {}
+    if run.get("verdict") is not None and run.get("flag_matrix") is None:
+        # Acceptance (product) artifact.
+        (out_dir / "acceptance.md").write_text(render_markdown_acceptance(run), encoding="utf-8")
+        written["acceptance_markdown"] = out_dir / "acceptance.md"
+        (out_dir / "acceptance.csv").write_text(render_csv_acceptance(run), encoding="utf-8")
+        written["acceptance_csv"] = out_dir / "acceptance.csv"
+        return written
+    if run.get("flag_matrix") is not None or run.get("go_nogo") is not None:
+        # PR7.4 answer-quality artifact — dedicated renderers, same out_dir.
+        (out_dir / "pr74.md").write_text(render_markdown_pr74(run), encoding="utf-8")
+        written["pr74_markdown"] = out_dir / "pr74.md"
+        (out_dir / "pr74.csv").write_text(render_csv_pr74(run), encoding="utf-8")
+        written["pr74_csv"] = out_dir / "pr74.csv"
+        return written
     (out_dir / "run.md").write_text(render_markdown_run(run), encoding="utf-8")
     written["markdown"] = out_dir / "run.md"
     (out_dir / "run.html").write_text(render_html_run(run), encoding="utf-8")
@@ -261,3 +275,439 @@ def write_reports(run: dict, out_dir: Path, comparison: dict | None = None) -> d
         (out_dir / "comparison.md").write_text(render_markdown_comparison(comparison), encoding="utf-8")
         written["comparison_markdown"] = out_dir / "comparison.md"
     return written
+
+
+def render_markdown_pr74(run: dict) -> str:
+    """Markdown report for a PR7.4 answer-quality run artifact."""
+    agg = run.get("aggregate") or {}
+    go = run.get("go_nogo") or {}
+    latency = run.get("latency") or {}
+    flags = run.get("flags_constant") or {}
+    matrix = run.get("flag_matrix") or {}
+    lines = [
+        f"# PR7.4 Answer Quality — {run.get('environment', {}).get('name')} ({run.get('timestamp')})",
+        "",
+        f"- git sha: `{run.get('git_sha') or 'n/a'}`",
+        f"- dataset: `{Path(run.get('dataset_file') or '').name}` ({run.get('case_count')} cases)",
+        f"- llm_replay: `{run.get('llm_replay')}`",
+        f"- environment: {run.get('environment', {}).get('doc_count')} docs / "
+        f"{run.get('environment', {}).get('chunk_count')} chunks",
+        f"- index fingerprint: `{(run.get('environment') or {}).get('index_fingerprint') or 'n/a'}`",
+        "",
+        "## GO / NO-GO",
+        "",
+        f"**Verdict: {go.get('verdict', 'n/a')}**",
+        f"- has_blocking_regression: `{go.get('has_blocking_regression')}`",
+        f"- blocking_case_ids: {go.get('blocking_case_ids') or []}",
+    ]
+    for reason in go.get("reasons") or []:
+        lines.append(f"- reason: {reason}")
+    crit = go.get("criteria") or {}
+    if crit:
+        lines += ["", "| Criterion | Pass |", "|---|---|"]
+        for key, value in crit.items():
+            lines.append(f"| {key} | {'✅' if value else '❌'} |")
+
+    lines += [
+        "",
+        "## Flags",
+        "",
+        f"- AUXILIARY_TERM_COVERAGE_ENABLED (constant): `{flags.get('AUXILIARY_TERM_COVERAGE_ENABLED')}`",
+        f"- MULTI_QUERY_RETRIEVAL_ENABLED (constant): `{flags.get('MULTI_QUERY_RETRIEVAL_ENABLED')}`",
+        "",
+        "| Mode | STATE_GATE | VALIDATION |",
+        "|---|---|---|",
+    ]
+    for mode in ("A", "B", "C", "D"):
+        m = matrix.get(mode) or {}
+        lines.append(
+            f"| {mode} | {m.get('DOCUMENT_STATE_GATE_ENABLED')} | "
+            f"{m.get('EVIDENCE_RUNTIME_VALIDATION_ENABLED')} |"
+        )
+
+    by_layer = agg.get("by_layer") or {}
+    first_layer = agg.get("first_failure_layer_counts") or {}
+
+    def layer_row(layer: str) -> str:
+        stats = by_layer.get(layer) or {}
+        return (
+            f"| {layer} | {stats.get('cases', 0)} | {stats.get('failures', 0)} | "
+            f"{stats.get('blocking', 0)} | {first_layer.get(layer, 0)} |"
+        )
+
+    lines += [
+        "",
+        "## Where it broke",
+        "",
+        "Failures attributed to the earliest pipeline layer responsible. "
+        "`first` counts cases whose earliest failing layer is this one — start debugging there.",
+        "",
+        "| Layer | Cases | Failures | Blocking | First |",
+        "|---|---|---|---|---|",
+        layer_row("RETRIEVAL"),
+        layer_row("EVIDENCE"),
+        layer_row("ANSWER"),
+        layer_row("SAFETY"),
+        "",
+        "## 1. Retrieval quality",
+        "",
+        "Did the evidence reach the pool at all? A failure here is a ranking problem, "
+        "not a gate problem.",
+        "",
+        "| Metric | Value |",
+        "|---|---|",
+        f"| cases with a retrieval failure | {(by_layer.get('RETRIEVAL') or {}).get('cases', 0)} |",
+        f"| expected_source_not_retrieved | {((by_layer.get('RETRIEVAL') or {}).get('codes') or {}).get('expected_source_not_retrieved', 0)} |",
+        f"| forbidden_source_retrieved (informational) | {((by_layer.get('RETRIEVAL') or {}).get('codes') or {}).get('forbidden_source_retrieved', 0)} |",
+        "",
+        "## 2. Answer quality",
+        "",
+        "Given correct evidence, did the answer use it and stay stable?",
+        "",
+        "| Metric | Value |",
+        "|---|---|",
+        f"| expected_source_not_cited | {((by_layer.get('ANSWER') or {}).get('codes') or {}).get('expected_source_not_cited', 0)} |",
+        f"| hedge_incorrectly_rewritten | {agg.get('hedge_incorrectly_rewritten')} |",
+        f"| unchanged | {agg.get('unchanged_count')} |",
+        f"| improved | {agg.get('improved_count')} |",
+        f"| degraded | {agg.get('degraded_count')} |",
+        f"| changed_neutral | {agg.get('changed_neutral_count')} |",
+        "",
+        "### Evidence verdicts",
+        "",
+        "| Metric | Value |",
+        "|---|---|",
+        f"| state_verdict_accuracy | {_pct(agg.get('state_verdict_accuracy'))} |",
+        f"| signed_confirmed_precision | {_pct(agg.get('signed_confirmed_precision'))} |",
+        f"| signed_confirmed_recall | {_pct(agg.get('signed_confirmed_recall'))} |",
+        f"| entity_mismatch_accuracy | {_pct(agg.get('entity_mismatch_accuracy'))} |",
+        f"| unverified_accuracy | {_pct(agg.get('unverified_accuracy'))} |",
+        f"| intent_coverage_accuracy | {_pct(agg.get('intent_coverage_accuracy'))} |",
+        f"| missing_need_accuracy | {_pct(agg.get('missing_need_accuracy'))} |",
+        "",
+        "## 3. Safety",
+        "",
+        "Assertions judged against the documents the answer actually leaned on "
+        "(cited ∪ state evidence), never against the whole retrieval pool.",
+        "",
+        "| Metric | Count |",
+        "|---|---|",
+        f"| false_signed_confirmations | {agg.get('false_signed_confirmations')} |",
+        f"| wrong_entity_citations | {agg.get('wrong_entity_citations')} |",
+        f"| unsupported_negative_signed_claims | {agg.get('unsupported_negative_signed_claims')} |",
+        f"| unsupported_positive_signed_claims | {agg.get('unsupported_positive_signed_claims')} |",
+        f"| blocking_count | {agg.get('blocking_count')} |",
+        f"| high_count | {agg.get('high_count')} |",
+        f"| medium_count | {agg.get('medium_count')} |",
+        f"| low_count | {agg.get('low_count')} |",
+        f"| safety_score (informational, never gates) | {agg.get('safety_score')} |",
+        "",
+        "## 4. Product usability",
+        "",
+        "This run measures SAFETY of the gate, not product value. "
+        "Whether AI Search finds the right document and answers the question is measured by "
+        "the acceptance benchmark (`python -m benchmark acceptance-run`) — a green run here "
+        "is not evidence the tool is useful.",
+    ]
+
+    by_cat = agg.get("by_category") or {}
+    if by_cat:
+        lines += ["", "## By category", "", "| Category | n | unchanged | improved | degraded | blocking | state acc |", "|---|---|---|---|---|---|---|"]
+        for cat, row in by_cat.items():
+            lines.append(
+                f"| {cat} | {row.get('case_count')} | {row.get('unchanged')} | {row.get('improved')} | "
+                f"{row.get('degraded')} | {row.get('blocking')} | {_pct(row.get('state_verdict_accuracy'))} |"
+            )
+
+    if latency:
+        lines += ["", "## Latency", "", f"- note: {latency.get('note') or ''}", ""]
+        warm = latency.get("warmup_excluded_case_ids") or []
+        if warm:
+            lines.append(f"- warmup excluded: {warm}")
+        lines += ["", "| Series | Mean ms | p95 ms | Min ms | Max ms | n |", "|---|---|---|---|---|---|"]
+        for key in (
+            "retrieval_ms", "live_answer_ms", "end_to_end_ms",
+            "state_gate_delta_ms", "validation_delta_ms", "candidate_delta_ms",
+        ):
+            stats = latency.get(key)
+            if not stats:
+                continue
+            lines.append(
+                f"| {key} | {stats['mean_ms']:.0f} | {stats['p95_ms']:.0f} | "
+                f"{_ms(stats.get('min_ms'))} | {_ms(stats.get('max_ms'))} | {stats['n']} |"
+            )
+
+    lines += [
+        "",
+        "## Cases",
+        "",
+        "| id | category | env | layer | delta | state exp/act | blocking | reasons |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for case in run.get("cases") or []:
+        ev = case.get("evaluation") or {}
+        failures = ev.get("failures") or []
+        blocking = any(f.get("severity") == "BLOCKING" for f in failures)
+        reasons = "; ".join(
+            f"{f.get('layer')}/{f.get('severity')}:{f.get('code')}" for f in failures[:4]
+        )
+        if case.get("error"):
+            reasons = f"ERROR: {case['error']}"
+        if case.get("warmup"):
+            reasons = (reasons + " | warmup (latency excluded only)").strip(" |")
+        lines.append(
+            f"| {case.get('id')} | {case.get('category')} | {case.get('environment')} | "
+            f"{ev.get('first_failure_layer') or '-'} | "
+            f"{ev.get('answer_delta') or '-'} | "
+            f"{ev.get('state_verdict_expected') or '-'} / {ev.get('state_verdict_actual') or '-'} | "
+            f"{'YES' if blocking else 'no'} | {reasons} |"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def render_markdown_acceptance(run: dict) -> str:
+    """AI Search Acceptance Report — the product-value view."""
+    agg = run.get("aggregate") or {}
+    verdict = run.get("verdict") or {}
+    env = run.get("environment") or {}
+    flags = run.get("flags") or {}
+
+    def rate(value) -> str:
+        return "n/a" if value is None else f"{value * 100:.0f}%"
+
+    def ms(value) -> str:
+        return "n/a" if value is None else f"{value:.0f} ms"
+
+    sat = run.get("sat_status") or {}
+
+    lines = [
+        f"# AI Search Acceptance Report — {env.get('name')} ({run.get('timestamp')})",
+        "",
+        f"- projekt: `{run.get('project_id') or 'n/a'}`",
+        f"- git sha: `{run.get('git_sha') or 'n/a'}`",
+        f"- dataset: `{Path(run.get('dataset_file') or '').name}` "
+        f"verze `{run.get('dataset_version') or 'neuvedena'}`",
+        f"- index: {env.get('doc_count')} docs / {env.get('chunk_count')} chunks, "
+        f"fingerprint `{(run.get('index_fingerprint') or 'n/a')[:16]}`",
+        f"- flags: STATE_GATE=`{flags.get('DOCUMENT_STATE_GATE_ENABLED')}` "
+        f"VALIDATION=`{flags.get('EVIDENCE_RUNTIME_VALIDATION_ENABLED')}` "
+        f"llm_replay=`{flags.get('llm_replay')}` (live generations only)",
+        "",
+    ]
+    for warning in run.get("warnings") or []:
+        lines.append(f"> **WARNING** {warning}")
+    if run.get("warnings"):
+        lines.append("")
+
+    # FAT and SAT are rendered as two separate verdicts on purpose. FAT is what
+    # the machine measured; SAT is whether a human stood behind the ground truth
+    # it measured against. A green FAT over unverified ground truth certifies
+    # nothing, and merging them into one headline is exactly how that gets
+    # misread as permission to deploy.
+    lines += [
+        "## FAT RESULT — automatické měření",
+        "",
+        f"**{verdict.get('verdict', 'n/a')}**",
+        "",
+        "| Metric | Value |",
+        "|---|---|",
+        f"| počet testů | {agg.get('case_count')} |",
+        f"| document_found_rate | {rate(agg.get('document_found_rate'))} "
+        f"({agg.get('document_found_count')}/{agg.get('retrieval_measured_count')}) |",
+        f"| top1_accuracy | {rate(agg.get('top1_accuracy'))} "
+        f"({agg.get('top1_count')}/{agg.get('retrieval_measured_count')}) |",
+        f"| top5_accuracy | {rate(agg.get('top5_accuracy'))} "
+        f"({agg.get('top5_count')}/{agg.get('retrieval_measured_count')}) |",
+        f"| answer_correct_rate | {rate(agg.get('answer_correct_rate'))} "
+        f"({agg.get('answer_correct_count')}/{agg.get('evaluated_count')}) |",
+        f"| citation_correct_rate | {rate(agg.get('citation_correct_rate'))} "
+        f"({agg.get('citation_correct_count')}/{agg.get('citation_measured_count')}) |",
+        f"| unsupported_claim_rate | {rate(agg.get('unsupported_claim_rate'))} "
+        f"({agg.get('unsupported_claim_count')}/{agg.get('evaluated_count')}) |",
+        f"| forbidden_document_rate | {rate(agg.get('forbidden_document_rate'))} "
+        f"({agg.get('forbidden_document_hit_count')}/{agg.get('forbidden_document_measured_count')}) |",
+        f"| počet kritických chyb | {agg.get('critical_error_count')} |",
+        f"| průměrný čas odpovědi | {ms(agg.get('mean_total_ms'))} |",
+        f"| p95 čas odpovědi | {ms(agg.get('p95_total_ms'))} |",
+        f"| průměrný počet dotazů na odpověď | "
+        f"{'n/a' if agg.get('mean_queries_to_answer') is None else format(agg['mean_queries_to_answer'], '.2f')} |",
+        "",
+        "Retrieval KPI se počítají jen z case, které pojmenovávají očekávaný dokument; "
+        "negativní a otevřené dotazy do jmenovatele nevstupují.",
+        "",
+        "## SAT STATUS — čeká na lidské ověření",
+        "",
+        "| Metric | Value |",
+        "|---|---|",
+        f"| human-verified case | {sat.get('verified_cases_count', run.get('verified_cases_count'))} |",
+        f"| čeká na ověření | {sat.get('pending_cases_count', run.get('pending_cases_count'))} |",
+        f"| podíl ověřených | {rate(sat.get('human_verified_rate'))} |",
+        f"| kritických case celkem | {sat.get('critical_cases_count', 'n/a')} |",
+        f"| kritických bez expert_confirm | "
+        f"{len(sat.get('critical_cases_without_expert_confirm') or [])} |",
+        f"| ground truth verified / unverified | "
+        f"{agg.get('verified_case_count')} / {agg.get('unverified_case_count')} |",
+        "",
+        f"**Připraveno pro denní použití: "
+        f"{'ANO' if sat.get('ready_for_daily_use') else 'NE'}**",
+        "",
+    ]
+    for blocker in sat.get("blockers") or []:
+        lines.append(f"- SAT blocker: {blocker}")
+    if sat.get("blockers"):
+        lines.append("")
+    if not sat.get("ready_for_daily_use"):
+        lines += [
+            "> Tento report **netvrdí**, že je AI Search připraven k nasazení. "
+            "FAT měří jen shodu s datasetem; dokud není každý case podepsán člověkem "
+            "a každý kritický case potvrzen odborníkem, je výsledek pouze měřením, "
+            "nikoli certifikací.",
+            "",
+        ]
+
+    lines += [
+        f"## GO / NO-GO: **{verdict.get('verdict', 'n/a')}**",
+        "",
+    ]
+    for blocker in verdict.get("blockers") or []:
+        lines.append(f"- **blocker**: {blocker}")
+    for reason in verdict.get("inconclusive_reasons") or []:
+        lines.append(f"- inconclusive: {reason}")
+    if not (verdict.get("blockers") or verdict.get("inconclusive_reasons")):
+        lines.append("- all acceptance criteria met")
+    observed = [
+        f for f in (verdict.get("observed_failures") or [])
+        if f not in (verdict.get("blockers") or [])
+    ]
+    if observed:
+        lines += [
+            "",
+            "Observed quality failures (not attributable to the product in this environment):",
+        ]
+        lines.extend(f"- {f}" for f in observed)
+
+    criteria = verdict.get("criteria") or {}
+    if criteria:
+        lines += ["", "| Criterion | Pass |", "|---|---|"]
+        for key, value in criteria.items():
+            lines.append(f"| {key} | {'✅' if value else '❌'} |")
+
+    if agg.get("critical_error_case_ids"):
+        lines += [
+            "",
+            "## Critical errors",
+            "",
+            "Wrong answers on legal/financial questions, or answers containing a forbidden claim. "
+            "Any non-zero count blocks deployment on its own.",
+            "",
+        ]
+        for case_id in agg["critical_error_case_ids"]:
+            lines.append(f"- `{case_id}`")
+
+    lines += [
+        "",
+        "## User value",
+        "",
+        "| Metric | Value |",
+        "|---|---|",
+        f"| vyřešeno prvním dotazem | {agg.get('resolved_within_one_query')} |",
+        f"| vyřešeno až follow-up dotazem | {agg.get('resolved_with_follow_up')} |",
+        f"| nevyřešeno vůbec | {agg.get('unresolved')} |",
+        "",
+        "## Where it broke",
+        "",
+        "| Layer | Cases |",
+        "|---|---|",
+    ]
+    for layer, count in sorted((agg.get("by_layer") or {}).items()):
+        lines.append(f"| {layer} | {count} |")
+
+    by_cat = agg.get("by_category") or {}
+    if by_cat:
+        lines += [
+            "",
+            "## By category",
+            "",
+            "| Category | n | doc found | top5 | answer correct | critical | unsupported |",
+            "|---|---|---|---|---|---|---|",
+        ]
+        for category, row in by_cat.items():
+            lines.append(
+                f"| {category} | {row.get('case_count')} | "
+                f"{rate(row.get('document_found_rate'))} | "
+                f"{rate(row.get('top5_accuracy'))} | "
+                f"{rate(row.get('answer_correct_rate'))} | {row.get('critical_errors')} | "
+                f"{row.get('unsupported_claims')} |"
+            )
+
+    lines += [
+        "",
+        "## Cases",
+        "",
+        "| id | category | crit | GT | doc | rank | answer | queries | ms | layer |",
+        "|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for case in run.get("cases") or []:
+        lines.append(
+            f"| {case.get('id')} | {case.get('category')} | {case.get('criticality')} | "
+            f"{case.get('ground_truth_status')} | "
+            f"{'✅' if case.get('document_found') else '❌'} | "
+            f"{case.get('document_rank') if case.get('document_rank') else '-'} | "
+            f"{'✅' if case.get('answer_correct') else '❌'} | "
+            f"{case.get('queries_to_answer') if case.get('queries_to_answer') else '-'} | "
+            f"{case.get('total_ms')} | {case.get('failure_layer')} |"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def render_csv_acceptance(run: dict) -> str:
+    buffer = io.StringIO()
+    fieldnames = [
+        "id", "category", "environment", "criticality", "ground_truth_status",
+        "expected_outcome", "document_found", "document_rank", "answer_correct",
+        "answer_used_expected_source", "citation_correct", "forbidden_document_hit",
+        "unsupported_claim", "critical_error", "failure_layer",
+        "queries_to_answer", "follow_ups_used", "retrieval_ms", "answer_ms",
+        "total_ms", "missing_phrases", "error",
+    ]
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for case in run.get("cases") or []:
+        row = dict(case)
+        row["missing_phrases"] = "; ".join(case.get("missing_phrases") or [])
+        writer.writerow(row)
+    return buffer.getvalue()
+
+
+def render_csv_pr74(run: dict) -> str:
+    buffer = io.StringIO()
+    fieldnames = [
+        "id", "category", "environment", "answer_delta",
+        "state_verdict_expected", "state_verdict_actual", "state_verdict_match",
+        "intent_coverage_expected", "intent_coverage_actual",
+        "blocking", "failure_codes", "warmup", "error",
+        "retrieval_ms", "llm_replay",
+    ]
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames)
+    writer.writeheader()
+    for case in run.get("cases") or []:
+        ev = case.get("evaluation") or {}
+        failures = ev.get("failures") or []
+        writer.writerow({
+            "id": case.get("id"),
+            "category": case.get("category"),
+            "environment": case.get("environment"),
+            "answer_delta": ev.get("answer_delta"),
+            "state_verdict_expected": ev.get("state_verdict_expected"),
+            "state_verdict_actual": ev.get("state_verdict_actual"),
+            "state_verdict_match": ev.get("state_verdict_match"),
+            "intent_coverage_expected": ev.get("intent_coverage_expected"),
+            "intent_coverage_actual": ev.get("intent_coverage_actual"),
+            "blocking": any(f.get("severity") == "BLOCKING" for f in failures),
+            "failure_codes": ";".join(f.get("code") or "" for f in failures),
+            "warmup": case.get("warmup"),
+            "error": case.get("error"),
+            "retrieval_ms": case.get("retrieval_ms"),
+            "llm_replay": case.get("llm_replay"),
+        })
+    return buffer.getvalue()

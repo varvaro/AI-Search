@@ -1,0 +1,11 @@
+# dataset_version: 0.1.0-pr822
+#
+# PR8.2.2 — End-to-end revision ranking (recall + ranking together).
+# Baseline: REVISION_RECALL_ENABLED=OFF, REVISION_RANKING_ENABLED=OFF
+# Candidate: both ON
+#
+{"id": "pr822-hmg-aktualni", "query": "najdi aktuální harmonogram stavby", "type": "positive", "expected_contains": ["_akt_4.08.2026", "akt_4.08.2026"], "forbidden_top5": ["/old/", "/OLD/"], "notes": "aktuální HMG → akt_4.08.2026 in top-5"}
+{"id": "pr822-hmg-platny", "query": "jaký harmonogram platí pro monolit?", "type": "positive", "expected_contains": ["_akt_4.08.2026", "akt_4.08.2026"], "forbidden_top5": ["/old/", "/OLD/"], "notes": "platný HMG → current revision"}
+{"id": "pr822-sod-final", "query": "poslední SoD FERI monolit final", "type": "positive", "expected_contains": ["/final/", "NOT251110"], "forbidden_top5": ["/old/", "/OLD/"], "notes": "finální SoD FERI → path /final/ AND NOT251110 (AND match)"}
+{"id": "pr822-ordinary-hmg", "query": "najdi HMG", "type": "control_ordinary", "expected_contains": [], "forbidden_top5": [], "notes": "běžný dotaz bez revision intent → pořadí identické s baseline"}
+{"id": "pr822-stary-hmg", "query": "starý harmonogram", "type": "control_old_ok", "expected_contains": [], "forbidden_top5": [], "notes": "bez currency intent → OLD smí vyhrát; pořadí identické (flags no-op)"}

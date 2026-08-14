@@ -1,0 +1,11 @@
+# dataset_version: 0.1.0-pr81.2
+#
+# PR8.1.2 — Subject→entity conjunction routing (ND Smíchov only).
+# No general synonyms. Queries deliberately omit explicit firm/NOT tokens.
+#
+{"id": "pr812-bozp-01", "query": "je podepsaná smlouva na BOZP?", "type": "positive", "expected_contains": ["SafetyPeak", "NOT250060"], "forbidden_contains": [], "notes": "BOZP + smlouva/podepsaná → SafetyPeak"}
+{"id": "pr812-ill-01", "query": "kdo dělá těsnění bílé vany?", "type": "positive", "expected_contains": ["Illichman", "NOT260916"], "forbidden_contains": [], "notes": "těsnění + bílá vana → Illichman"}
+{"id": "pr812-feri-01", "query": "kdo je dodavatel monolitu?", "type": "positive", "expected_contains": ["FERI", "NOT251110"], "forbidden_contains": [], "notes": "monolit + dodavatel → FERI"}
+{"id": "pr812-neg-beton", "query": "jaký beton je ve spodní stavbě?", "type": "negative", "expected_contains": [], "forbidden_contains": ["SafetyPeak", "Illichman", "FERI", "NOT250060", "NOT260916", "NOT251110"], "notes": "no subject conjunction"}
+{"id": "pr812-neg-spana", "query": "jaké těsnění je v pracovní spáře?", "type": "negative", "expected_contains": [], "forbidden_contains": ["Illichman", "NOT260916", "SafetyPeak", "FERI"], "notes": "těsnění alone must not route to Illichman"}
+{"id": "pr812-neg-penta", "query": "najdi Pentaflex", "type": "negative", "expected_contains": ["PENTAFLEX", "Pentaflex"], "forbidden_contains": ["Illichman", "NOT260916", "SafetyPeak", "FERI"], "notes": "Pentaflex must not pull subject-routed suppliers"}

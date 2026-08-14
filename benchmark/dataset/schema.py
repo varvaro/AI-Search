@@ -132,10 +132,111 @@ VALID_TYPES = {"lookup", "checklist", "factual", "comparison", "negative"}
 VALID_DIFFICULTIES = {"easy", "medium", "hard"}
 VALID_ENVIRONMENTS = {"fixture", "production"}
 VALID_RELEVANCE_MODES = {"document", "chunk", "multi_document_reasoning"}
+# PR7.4 answer-quality (safety) categories. Empty string keeps every pre-PR7.4
+# case byte-compatible (category is optional and defaults to "").
+SAFETY_CATEGORIES = {"SIGNED_DOCUMENT", "ENTITY_SAFETY", "EVIDENCE_COVERAGE", "REGRESSION"}
+# PR7.4.1 acceptance (product) categories - the work a site manager actually
+# does. Kept as a SEPARATE set from the safety categories on purpose: a safety
+# benchmark answers "can this tool lie about a contract", an acceptance
+# benchmark answers "does this tool save me a trip into the Box folders". Mixing
+# them into one score is how a green safety run gets mistaken for a usable
+# product (audit section 5).
+ACCEPTANCE_CATEGORIES = {
+    "DOCUMENT_LOOKUP",       # "kde najdu kladečské výkresy výztuže?"
+    "TECHNICAL_INFO",        # "v jakém stáří se zkouší krychle betonu?"
+    "CONTRACT_VERIFICATION", # "co upravuje dodatek smlouvy o dílo?"
+    "MEETING_MINUTES",       # zápisy z kontrolních dnů
+    "TECHNICAL_PROCEDURE",   # montážní/technologické postupy
+}
+# PR7.5 project acceptance categories - the FAT/SAT agenda of ONE building site
+# (240783160_Garáže_NDS), phrased the way its site manager phrases it. Kept
+# separate from ACCEPTANCE_CATEGORIES because those describe a generic document
+# assistant while these describe the construction agenda under certification.
+PROJECT_ACCEPTANCE_CATEGORIES = {
+    "DOCUMENT_SEARCH",    # najdi výkres výztuže základové desky
+    "TECHNICAL_QA",       # jaký beton je na spodní stavbě?
+    "DOCUMENT_STATUS",    # existuje podepsaná smlouva na monolit?
+    "CONSTRUCTION_MGMT",  # jaké jsou závazné termíny pro FERI?
+    "ADVERSARIAL",        # stará revize vs. nová, draft vs. final, dvojí dodavatel
+}
+VALID_CATEGORIES = (
+    {""} | SAFETY_CATEGORIES | ACCEPTANCE_CATEGORIES | PROJECT_ACCEPTANCE_CATEGORIES
+)
+VALID_STATE_VERDICTS = {
+    "SIGNED_CONFIRMED", "UNSIGNED_CONFIRMED", "ENTITY_MISMATCH", "UNVERIFIED", "NOOP",
+}
+VALID_INTENT_COVERAGES = {"COMPLETE", "PARTIAL"}
+# How bad a wrong answer is. Only legal/financial mistakes count as CRITICAL
+# errors in the acceptance report - an imprecise answer about a technical detail
+# the user will verify anyway is not the same class of harm as a wrong claim
+# about a signed contract or an invoiced amount.
+# "safety" (PR7.5) sits next to legal/financial as a CRITICAL class: a wrong
+# answer about concrete cover or a superseded reinforcement drawing is a defect
+# that gets built into the structure, not an inconvenience the reader corrects.
+VALID_CRITICALITIES = {"legal", "financial", "safety", "technical", "informational"}
+# Whether a human has confirmed this case's ground truth against the real index.
+# Acceptance GO is impossible while unverified cases are present: a dataset
+# nobody checked cannot certify a tool for daily use.
+VALID_GROUND_TRUTH_STATUSES = {"verified", "needs_review", "unverified"}
+# PR7.5. What the case asserts about the WORLD, independent of what retrieval
+# does: "found" = the thing exists and must be produced, "not_found" = the thing
+# genuinely is not in the index and the only correct answer says so. Negative
+# cases are first-class here because "kniha betonů" and "stavební deník" do not
+# exist in 240783160_Garáže_NDS at all - writing them as positives would mint a
+# permanently red dataset, and omitting them would drop the failure mode most
+# likely to mislead a site manager.
+VALID_EXPECTED_OUTCOMES = {"found", "not_found"}
+# PR7.5. HOW a case's ground truth was established. `index_query` is the only
+# machine-checkable one and is deliberately the weakest: a file existing in the
+# index proves neither that it is current nor that its content answers the
+# question. Critical cases therefore require `expert_confirm`, and negative
+# cases require `folder_listing` - absence from a full-text search is not proof
+# of absence from the archive.
+VALID_VERIFICATION_METHODS = {
+    "",                # not yet decided
+    "index_query",     # file provably present in the index (read-only SQL)
+    "folder_listing",  # a human walked the folder, absence included
+    "document_read",   # a human opened the document and read the fact
+    "expert_confirm",  # the responsible professional confirmed it
+    "cross_document",  # the fact agrees across two independent documents
+}
+# Criticality classes where a wrong answer is a critical error, and where
+# `index_query` alone can never be sufficient verification.
+CRITICAL_CRITICALITY_NAMES = frozenset({"legal", "financial", "safety"})
 
 
 def _fold(text: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFKD", (text or "").casefold()) if not unicodedata.combining(c))
+
+
+# PR7.5 spells its fields in the singular, product-facing form ("query",
+# "expected_document"). The canonical names predate it and are load-bearing in
+# ~800 tests and every existing .jsonl, so the two are reconciled by aliasing on
+# read rather than by renaming. Writing BOTH spellings is an error: silently
+# preferring one would make a case mean something other than what it says.
+FIELD_ALIASES = {
+    "query": "question",
+    "expected_document": "expected_documents",
+    "expected_source": "expected_source_contains",
+    "expected_answer_keywords": "expected_answer_contains",
+    "forbidden_answer_keywords": "forbidden_answer_contains",
+}
+
+
+def _resolve_aliases(data: dict, *, source_file: str = "", line_number: int = 0) -> dict:
+    if not any(alias in data for alias in FIELD_ALIASES):
+        return data
+    resolved = dict(data)
+    for alias, canonical in FIELD_ALIASES.items():
+        if alias not in resolved:
+            continue
+        if canonical in resolved:
+            raise ValueError(
+                f"{source_file}:{line_number}: case {data.get('id')!r} sets both {alias!r} and "
+                f"{canonical!r} - they are the same field, pick one"
+            )
+        resolved[canonical] = resolved.pop(alias)
+    return resolved
 
 
 @dataclass
@@ -186,9 +287,34 @@ class BenchmarkCase:
     notes: str = ""
     source_file: str = ""
     line_number: int = 0
+    # PR7.4 answer-quality fields (all optional; empty defaults keep every
+    # pre-PR7.4 .jsonl line loadable without change).
+    category: str = ""
+    expected_state_verdict: str | None = None
+    expected_intent_coverage: str | None = None
+    expected_missing_needs: list[str] = field(default_factory=list)
+    forbidden_answer_contains: list[str] = field(default_factory=list)
+    expected_source_contains: list[str] = field(default_factory=list)
+    forbidden_sources: list[str] = field(default_factory=list)
+    # PR7.4.1 acceptance fields (all optional; defaults keep every earlier
+    # .jsonl line loadable unchanged).
+    criticality: str = "informational"
+    ground_truth_status: str = "unverified"
+    expected_fact: str = ""
+    follow_up_questions: list[str] = field(default_factory=list)
+    # PR7.5 project-acceptance fields (all optional; defaults keep every earlier
+    # .jsonl line loadable unchanged).
+    expected_outcome: str = "found"
+    forbidden_document: list[str] = field(default_factory=list)
+    verification_method: str = ""
+    human_verified: bool = False
+    verified_by: str = ""
+    verification_date: str = ""
+    index_fingerprint_at_verification: str = ""
 
     @staticmethod
     def from_dict(data: dict, *, source_file: str = "", line_number: int = 0) -> "BenchmarkCase":
+        data = _resolve_aliases(data, source_file=source_file, line_number=line_number)
         if "id" not in data or not str(data["id"]).strip():
             raise ValueError(f"{source_file}:{line_number}: case is missing required field 'id'")
         if "question" not in data or not str(data["question"]).strip():
@@ -212,6 +338,31 @@ class BenchmarkCase:
         retrieval_issue = bool(data.get("expected_retrieval_issue", False))
         if content_missing and retrieval_issue:
             raise ValueError(f"{source_file}:{line_number}: case {data['id']!r} sets both expected_content_missing and expected_retrieval_issue - these are mutually exclusive diagnoses (content absent vs. content present but unreachable)")
+        category = str(data.get("category", "") or "")
+        if category not in VALID_CATEGORIES:
+            raise ValueError(f"{source_file}:{line_number}: case {data['id']!r} has invalid category {category!r} (expected one of {sorted(VALID_CATEGORIES - {''})} or omit)")
+        expected_state_verdict = data.get("expected_state_verdict")
+        if expected_state_verdict is not None:
+            expected_state_verdict = str(expected_state_verdict)
+            if expected_state_verdict not in VALID_STATE_VERDICTS:
+                raise ValueError(f"{source_file}:{line_number}: case {data['id']!r} has invalid expected_state_verdict {expected_state_verdict!r}")
+        expected_intent_coverage = data.get("expected_intent_coverage")
+        if expected_intent_coverage is not None:
+            expected_intent_coverage = str(expected_intent_coverage)
+            if expected_intent_coverage not in VALID_INTENT_COVERAGES:
+                raise ValueError(f"{source_file}:{line_number}: case {data['id']!r} has invalid expected_intent_coverage {expected_intent_coverage!r}")
+        criticality = str(data.get("criticality", "informational") or "informational")
+        if criticality not in VALID_CRITICALITIES:
+            raise ValueError(f"{source_file}:{line_number}: case {data['id']!r} has invalid criticality {criticality!r} (expected one of {sorted(VALID_CRITICALITIES)})")
+        ground_truth_status = str(data.get("ground_truth_status", "unverified") or "unverified")
+        if ground_truth_status not in VALID_GROUND_TRUTH_STATUSES:
+            raise ValueError(f"{source_file}:{line_number}: case {data['id']!r} has invalid ground_truth_status {ground_truth_status!r} (expected one of {sorted(VALID_GROUND_TRUTH_STATUSES)})")
+        expected_outcome = str(data.get("expected_outcome", "found") or "found")
+        if expected_outcome not in VALID_EXPECTED_OUTCOMES:
+            raise ValueError(f"{source_file}:{line_number}: case {data['id']!r} has invalid expected_outcome {expected_outcome!r} (expected one of {sorted(VALID_EXPECTED_OUTCOMES)})")
+        verification_method = str(data.get("verification_method", "") or "")
+        if verification_method not in VALID_VERIFICATION_METHODS:
+            raise ValueError(f"{source_file}:{line_number}: case {data['id']!r} has invalid verification_method {verification_method!r} (expected one of {sorted(VALID_VERIFICATION_METHODS - {''})} or omit)")
         return BenchmarkCase(
             id=str(data["id"]),
             question=str(data["question"]),
@@ -233,6 +384,24 @@ class BenchmarkCase:
             notes=str(data.get("notes", "")),
             source_file=source_file,
             line_number=line_number,
+            category=category,
+            expected_state_verdict=expected_state_verdict,
+            expected_intent_coverage=expected_intent_coverage,
+            expected_missing_needs=list(data.get("expected_missing_needs", [])),
+            forbidden_answer_contains=list(data.get("forbidden_answer_contains", [])),
+            expected_source_contains=list(data.get("expected_source_contains", [])),
+            forbidden_sources=list(data.get("forbidden_sources", [])),
+            criticality=criticality,
+            ground_truth_status=ground_truth_status,
+            expected_fact=str(data.get("expected_fact", "")),
+            follow_up_questions=list(data.get("follow_up_questions", [])),
+            expected_outcome=expected_outcome,
+            forbidden_document=list(data.get("forbidden_document", [])),
+            verification_method=verification_method,
+            human_verified=bool(data.get("human_verified", False)),
+            verified_by=str(data.get("verified_by", "")),
+            verification_date=str(data.get("verification_date", "")),
+            index_fingerprint_at_verification=str(data.get("index_fingerprint_at_verification", "")),
         )
 
 
@@ -258,6 +427,26 @@ def load_dataset(path: Path) -> list[BenchmarkCase]:
         seen_ids.add(case.id)
         cases.append(case)
     return cases
+
+
+DATASET_VERSION_PREFIX = "# dataset_version:"
+
+
+def read_dataset_version(path: Path) -> str:
+    """Version declared by a `# dataset_version: X` comment in the .jsonl head.
+
+    Kept as a comment rather than a per-case field so the version cannot drift
+    between lines of the same file. Returns "" when absent, which the acceptance
+    artifact reports verbatim - an unversioned dataset is a fact worth showing,
+    not something to paper over with a default.
+    """
+    for raw_line in Path(path).read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if line.startswith(DATASET_VERSION_PREFIX):
+            return line[len(DATASET_VERSION_PREFIX):].strip()
+        if line and not line.startswith("#"):
+            break
+    return ""
 
 
 def load_datasets(paths: list[Path]) -> list[BenchmarkCase]:

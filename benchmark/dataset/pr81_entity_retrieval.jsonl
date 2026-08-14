@@ -1,0 +1,13 @@
+# dataset_version: 0.1.0-pr81.1
+#
+# PR8.1.1 — Entity Match Bonus retrieval-only cases (ND Smíchov).
+# Explicit entity / NOT tokens in the query only — NO subject aliases.
+#
+{"id": "pr81-sp-01", "query": "je podepsaná smlouva SafetyPeak BOZP NOT250060?", "type": "positive", "expected_name_contains": ["SafetyPeak", "NOT250060"], "expected_all_contains": ["SafetyPeak"], "notes": "explicit SafetyPeak + NOT in query"}
+{"id": "pr81-feri-01", "query": "závazné termíny FERI NOT251110 monolit SoD", "type": "positive", "expected_name_contains": ["NOT251110"], "expected_all_contains": ["NOT251110", "FERI"], "notes": "FERI + NOT251110 explicit"}
+{"id": "pr81-ill-01", "query": "těsnění bílé vany Illichman NOT260916", "type": "positive", "expected_name_contains": ["NOT260916"], "expected_all_contains": ["Illichman", "NOT260916"], "notes": "Illichman + NOT explicit"}
+{"id": "pr81-sta-01", "query": "zakázky Stafitech zdění NOT250039 NOT250304", "type": "positive", "expected_name_contains": [], "expected_all_contains": ["NOT250039", "NOT250304"], "multi_entity": true, "notes": "both Stafitech order numbers must appear in top-10"}
+{"id": "pr81-bic-01", "query": "zakázky Bičík inženýring zábory NOT260609 NOT260871", "type": "positive", "expected_name_contains": [], "expected_all_contains": ["NOT260609", "NOT260871"], "multi_entity": true, "notes": "both Bičík order numbers in top-10"}
+{"id": "pr81-hilt-01", "query": "Hilt Rent NOT250647 NOT251133 zakázky", "type": "positive", "expected_name_contains": [], "expected_all_contains": ["NOT250647", "NOT251133"], "multi_entity": true, "notes": "both Hilt Rent orders in top-10"}
+{"id": "pr81-neg-haus", "query": "je na boxu podepsaná smlouva haus365?", "type": "negative", "forbidden_name_contains": ["SafetyPeak", "FERI", "Illichman", "Stafitech", "NOT250060", "NOT251110"], "expected_name_contains": ["HAUS365", "haus365"], "notes": "must not false-boost unrelated entities"}
+{"id": "pr81-neg-penta", "query": "jaký je postup montáže Pentaflexu?", "type": "negative", "forbidden_name_contains": ["Illichman", "NOT260916", "Stafitech"], "expected_name_contains": ["PENTAFLEX", "Pentaflex"], "notes": "Pentaflex must not pull Illichman"}

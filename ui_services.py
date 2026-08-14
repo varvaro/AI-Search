@@ -9,6 +9,7 @@ from pathlib import Path
 import ai_search
 from ai_search_config import (
     APP_SUPPORT_DIR,
+    EVIDENCE_RUNTIME_VALIDATION_ENABLED,
     MAX_SUBQUERIES,
     MULTI_QUERY_FACET_FETCH_LIMIT,
     MULTI_QUERY_RETRIEVAL_ENABLED,
@@ -88,15 +89,14 @@ def _merge_multi_query_documents(output: list[dict], is_question: bool) -> tuple
         base.pop("_mq_source", None)
 
         # Richer quotes may include facet legs; ranking scores may not.
-        all_quotes = [
-            row["quote"]
-            for row in sorted(rows, key=_score_sort_key)
-            if row.get("quote")
-        ]
+        all_rows = [row for row in sorted(rows, key=_score_sort_key) if row.get("quote")]
+        all_quotes = [row["quote"] for row in all_rows]
+        rank_rows: list[dict] = []
         rank_quotes: list[str] = []
         rank_scores: list[float] = []
         for row in sorted(ranking_rows, key=_score_sort_key):
             if row.get("quote"):
+                rank_rows.append(row)
                 rank_quotes.append(row["quote"])
                 rank_scores.append(float(row["score"]))
 
@@ -104,6 +104,11 @@ def _merge_multi_query_documents(output: list[dict], is_question: bool) -> tuple
         base["quote"] = quote
         if evidence:
             base["evidence"] = evidence
+        if EVIDENCE_RUNTIME_VALIDATION_ENABLED:
+            # Same list the quotes above came from, so rank indices align.
+            base["_evidence_spans"] = _capture_evidence_spans(
+                all_rows if all_quotes else rank_rows, evidence, quote,
+            )
         base["best_chunk_score"] = float(base["score"])
         if not is_question and rank_scores:
             base["score"] = _document_evidence_score(rank_scores[0], rank_scores, rank_quotes)
@@ -366,6 +371,80 @@ def _merge_quote_chunks(chunks: list[str], max_chars: int = QUOTE_MERGE_MAX_CHAR
     quote = separator.join(item["text"] for item in evidence)[:max_chars]
     return quote, evidence
 
+# --- PR7.1: additive chunk-span capture (EVIDENCE_RUNTIME_VALIDATION_ENABLED) ---
+#
+# WHY THIS EXISTS: search_all() returns ONE row per document, whose `quote` is a
+# merge of several chunks' excerpts (see _merge_quote_chunks above). The merge
+# keeps the best chunk's identity in the base row and drops the rest, so a later
+# validation layer has no way to tell WHICH chunks the answer text could rest on
+# - `row["evidence"]` carries the excerpt texts but no document_id/chunk_id.
+#
+# This capture closes that gap WITHOUT touching the merge: it records, per
+# returned document, the chunk rows that actually contributed to the merged
+# quote. Nothing consumes `_evidence_spans` yet (PR7.1 is capture only) and the
+# whole path is skipped when the flag is OFF, so the default output is
+# byte-identical to pre-PR7.1.
+
+def _evidence_span_from_row(row: dict, rank: int, excerpt: str) -> dict:
+    """One captured chunk span: real identity + the excerpt it contributed.
+
+    `excerpt` is the text that ACTUALLY entered the merged quote, not the
+    chunk's full quote. A validation layer must only ever check an answer
+    against text the LLM was given; using the untruncated chunk here would let
+    a claim be "confirmed" by a sentence that the quote budget cut away.
+
+    `rank` is the chunk's relevance position within its own document - the same
+    index `row["evidence"][i]["rank"]` uses, so the two can be joined.
+
+    Returns a fresh dict of scalars: a consumer holding a span can never mutate
+    the retrieval row it came from.
+    """
+    span = {
+        "document_id": row.get("document_id"),
+        "chunk_id": row.get("chunk_id"),
+        "path": str(row.get("path") or ""),
+        "document": str(row.get("document") or ""),
+        "quote": excerpt,
+        "score": float(row.get("score") or 0.0),
+        "rank": rank,
+    }
+    # Source metadata, only when the row carries it: `source` is the index the
+    # chunk came from (Dokument / E-mail / Poznámka), `_mq_source` the retrieval
+    # leg (PR2 provenance, absent on the default single-leg path).
+    for key in ("source", "_mq_source"):
+        value = row.get(key)
+        if value:
+            span[key] = value
+    return span
+
+
+def _capture_evidence_spans(chunk_rows: list[dict], evidence: list[dict], merged_quote: str) -> list[dict]:
+    """Map a merged quote's excerpts back to the chunk rows that produced them.
+
+    `chunk_rows[i]` must describe the same chunk as the i-th text handed to
+    _merge_quote_chunks(), which holds at both call sites because the row list
+    and the quote list are appended under the SAME `if row.get("quote")`
+    condition and in the same order - the alignment `_document_evidence_score()`
+    already relies on.
+
+    Only contributing chunks are captured. A chunk that lost its quota slot to
+    the near-duplicate filter or ran out of character budget is not part of the
+    answer's evidence, so reporting it would overstate what was actually shown.
+
+    _merge_quote_chunks() returns an empty `evidence` list for the single-chunk
+    case (the merged quote IS that chunk's truncated text), which is why the
+    fallback below re-uses `merged_quote` instead of re-deriving the truncation.
+    """
+    if evidence:
+        return [
+            _evidence_span_from_row(chunk_rows[item["rank"]], item["rank"], item["text"])
+            for item in evidence
+            if 0 <= item.get("rank", -1) < len(chunk_rows)
+        ]
+    if chunk_rows and merged_quote:
+        return [_evidence_span_from_row(chunk_rows[0], 0, merged_quote)]
+    return []
+
 # --- Document-level evidence aggregation (search_all's path-merge step) ---
 #
 # WHY THIS EXISTS: search_all() collapses a document's many retrieved chunks
@@ -503,17 +582,21 @@ def search_all(query: str, settings: Settings, state_dir: Path, embeddings, is_q
     # replaces). `chunks_by_path` collects quotes in the same relevance order
     # `unique`'s winning row was picked in, since both loop over the same
     # score-descending `sorted(output, ...)` sequence.
-    unique={}; chunks_by_path={}; scores_by_path={}
+    unique={}; chunks_by_path={}; scores_by_path={}; rows_by_path={}
     for row in sorted(output,key=lambda item:item["score"],reverse=True):
         path=row["path"]
         if path not in unique:
-            unique[path]=row; chunks_by_path[path]=[]; scores_by_path[path]=[]
-        # Both lists are appended under the SAME condition, so index i of one
-        # always describes the same chunk as index i of the other -
-        # _document_evidence_score() relies on that alignment.
-        if row.get("quote"): chunks_by_path[path].append(row["quote"]); scores_by_path[path].append(row["score"])
+            unique[path]=row; chunks_by_path[path]=[]; scores_by_path[path]=[]; rows_by_path[path]=[]
+        # All three lists are appended under the SAME condition, so index i of
+        # one always describes the same chunk as index i of the others -
+        # _document_evidence_score() and _capture_evidence_spans() rely on that
+        # alignment. `rows_by_path` keeps the pre-merge rows, so the captured
+        # chunk identity survives the `row["quote"]` overwrite below.
+        if row.get("quote"): chunks_by_path[path].append(row["quote"]); scores_by_path[path].append(row["score"]); rows_by_path[path].append(row)
     for path,row in unique.items():
         quote,evidence=_merge_quote_chunks(chunks_by_path[path])
+        if EVIDENCE_RUNTIME_VALIDATION_ENABLED:
+            row["_evidence_spans"]=_capture_evidence_spans(rows_by_path[path],evidence,quote)
         row["quote"]=quote
         if evidence: row["evidence"]=evidence
         # Document-level evidence aggregation (see _document_evidence_score).

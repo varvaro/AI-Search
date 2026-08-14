@@ -1,13 +1,50 @@
 #!/usr/bin/env python3
 """Hybridní backend AI Search nad lokální složkou Box Drive."""
 from __future__ import annotations
-import argparse, collections, contextlib, fcntl, gc, hashlib, json, logging, multiprocessing, os, queue, re, resource, shutil, sqlite3, subprocess, tempfile, threading, time, traceback, urllib.request, uuid
+import argparse, collections, contextlib, fcntl, gc, hashlib, json, logging, multiprocessing, os, queue, re, resource, shutil, sqlite3, subprocess, tempfile, threading, time, traceback, unicodedata, urllib.request, uuid
 import numpy as np
 from pathlib import Path
-from ai_search_config import BOX_ROOT, STATE_DIR, EMBEDDING_MODEL, OLLAMA_ENDPOINT, DEFAULT_MODEL, COMPLEX_MODEL, PARSE_TIMEOUT_SECONDS, CHUNK_TIMEOUT_SECONDS, EMBEDDING_TIMEOUT_SECONDS, EMBEDDING_BATCH_SIZE, MSG_PARSE_TIMEOUT_SECONDS
+from ai_search_config import (
+    BOX_ROOT,
+    STATE_DIR,
+    EMBEDDING_MODEL,
+    OLLAMA_ENDPOINT,
+    DEFAULT_MODEL,
+    COMPLEX_MODEL,
+    PARSE_TIMEOUT_SECONDS,
+    CHUNK_TIMEOUT_SECONDS,
+    EMBEDDING_TIMEOUT_SECONDS,
+    EMBEDDING_BATCH_SIZE,
+    MSG_PARSE_TIMEOUT_SECONDS,
+    AUXILIARY_TERM_COVERAGE_ENABLED,
+    AUX_FTS_LIMIT,
+    AUX_MAX_NEW_IDS,
+    AUX_DF_RARE_MAX,
+    AUX_PREFIX_DF_MAX,
+    DOCUMENT_STATE_GATE_ENABLED,
+    EVIDENCE_RUNTIME_VALIDATION_ENABLED,
+    ENTITY_MATCH_BONUS_ENABLED,
+    SUBJECT_ENTITY_ALIAS_ENABLED,
+    REVISION_RANKING_ENABLED,
+    REVISION_RECALL_ENABLED,
+    OLD_REVISION_GUARD_ENABLED,
+    CITATION_CONTRACT_ENABLED,
+    ABSTENTION_OVERRIDE_ENABLED,
+    STRUCTURED_SUMMARY_CITATION_ENABLED,
+    FALLBACK_CITATION_CONTRACT_ENABLED,
+    JSON_SENTINEL_FALLBACK_ENABLED,
+    QUERY_FOCUSED_CONTEXT_PACKING_ENABLED,
+)
+import entity_match_bonus  # PR8.1.1/8.1.2: optional Phase-3 entity name/path bonus
+import revision_ranking  # PR8.2: optional Phase-3 revision intent score
+import revision_recall  # PR8.2.1: optional append-only revision candidate recall
+import old_revision_guard  # PR8.3: optional OLD/ authority demotion in answer()
+import context_packing  # PR9.3.3: optional pre-LLM query-focused context packing
 from document_extractors import INDEXED_EXTS, extract_text, extract_eml, clean_cell_text, format_sheet_section
 import parsing_worker  # stable multiprocessing.Process targets, see parsing_worker.py docstring
 import query_expansion  # Query Understanding layer, opt-in via search(expand_query=True)
+import auxiliary_term_coverage  # PR5 spike: optional pre-rerank FTS candidate union
+import document_state  # PR6: deterministic signed-contract answer safety gate
 
 SUPPORTED = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".txt", ".md", ".csv", ".rtf", ".eml", ".msg", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp"}
 
@@ -1358,6 +1395,57 @@ def search(query, db_path, lance_dir, embeddings, limit=8, is_question=False, tr
         top_ids=[c["chunk_id"] for c in pre_ce_candidates]
     else:
         union=None; top_ids=fusion_order[:rerank_k]
+
+    # PR5 / PR5.1: optional auxiliary conjunctive FTS — APPEND-only onto top_ids
+    # before Phase 3. Never mutates fts_ids/vector_ids/rrf_scores/fusion_order.
+    # Flag OFF (default) skips this block entirely → bit-identical to pre-PR5.
+    # PR5.1: aux_matched_ids powers diagnostic candidate_origin / aux_hit only.
+    aux_trace=None
+    aux_matched_ids=set()
+    if AUXILIARY_TERM_COVERAGE_ENABLED:
+        try:
+            aux_result=auxiliary_term_coverage.collect_auxiliary_chunk_ids(
+                db_path,
+                query,
+                exclude_ids=top_ids,
+                df_rare_max=AUX_DF_RARE_MAX,
+                fts_limit=AUX_FTS_LIMIT,
+                max_new_ids=AUX_MAX_NEW_IDS,
+                prefix_df_max=AUX_PREFIX_DF_MAX,
+            )
+            aux_trace=aux_result.as_trace_dict()
+            aux_matched_ids=set(aux_result.matched_ids)
+            if aux_result.added_ids:
+                top_ids=list(top_ids)+list(aux_result.added_ids)
+        except Exception as exc:
+            # Spike must never break retrieval — degrade to the pre-aux pool.
+            aux_trace={"activated":False,"reason":"error","error":repr(exc),
+                       "added_ids":[],"matched_ids":[],"matched_count":0,"added_count":0,
+                       "anchor":None,"constraints":[],"match":None}
+
+    # PR8.2.1: revision-intent append-only recall — AFTER aux, BEFORE Phase 3.
+    # Flag OFF → skip entirely (byte-identical). Seeds a floor RRF score for
+    # newly appended ids so Phase-3 `rrf_scores[cid]` never KeyErrors.
+    rev_recall_trace=None
+    rev_recall_added_ids=set()
+    if REVISION_RECALL_ENABLED:
+        try:
+            rr_result=revision_recall.collect_revision_chunk_ids(
+                db_path, query, exclude_ids=top_ids,
+            )
+            rev_recall_trace=rr_result.as_trace_dict()
+            if rr_result.added_ids:
+                floor=1.0/(RRF_RANK_CONSTANT+max(rerank_k,1))
+                top_ids=list(top_ids)
+                for cid in rr_result.added_ids:
+                    if cid not in rrf_scores:
+                        rrf_scores[cid]=floor
+                    top_ids.append(cid)
+                    rev_recall_added_ids.add(cid)
+        except Exception as exc:
+            rev_recall_trace={"activated":False,"reason":"error","error":repr(exc),
+                              "added_ids":[],"added_count":0,"matched_document_names":[]}
+
     if _tracing:
         fts_rank_of={cid:i for i,cid in enumerate(fts_ids)}; vector_rank_of={cid:i for i,cid in enumerate(vector_ids)}
         vector_doc_id_by_chunk={row["id"]:row.get("document_id") for row in vector_rows}
@@ -1367,12 +1455,28 @@ def search(query, db_path, lance_dir, embeddings, limit=8, is_question=False, tr
         # so a benchmark can compare "what RRF would have kept" against
         # "everything either channel found" even on a legacy-strategy run.
         trace.union_candidates=union if union is not None else _build_candidate_union(fts_ids,vector_ids)
-        trace.candidates_before_precision=[{"chunk_id":cid} for cid in top_ids]
+        primary_for_trace=set(fts_ids)|set(vector_ids)
+        if AUXILIARY_TERM_COVERAGE_ENABLED:
+            trace.candidates_before_precision=[{
+                "chunk_id":cid,
+                "aux_hit":cid in aux_matched_ids,
+                "candidate_origin":auxiliary_term_coverage.candidate_origin(
+                    primary=cid in primary_for_trace, aux_hit=cid in aux_matched_ids),
+            } for cid in top_ids]
+        else:
+            trace.candidates_before_precision=[{"chunk_id":cid} for cid in top_ids]
         if candidate_strategy==CANDIDATE_STRATEGY_UNION_CE:
             trace.candidates_before_cross_encoder=[{"chunk_id":cid} for cid in top_ids]
         trace.timings["fusion_rrf"]=(time.perf_counter()-_t)*1000
         trace.metadata["candidate_pool_size_before_truncation"]=len(fusion_order)
         trace.metadata["candidate_pool_size_after_truncation"]=len(top_ids)
+        if aux_trace is not None:
+            trace.metadata["auxiliary_term_coverage"]=aux_trace
+        if rev_recall_trace is not None:
+            trace.metadata["revision_recall"]=rev_recall_trace
+            if REVISION_RECALL_ENABLED:
+                for entry in trace.candidates_before_precision:
+                    entry["revision_recall_hit"]=entry.get("chunk_id") in rev_recall_added_ids
 
     # Phase 3: exact cosine similarity reranking. Vectors already fetched during
     # retrieval are reused; only candidates missing a vector (FTS-only hits) need
@@ -1458,7 +1562,37 @@ def search(query, db_path, lance_dir, embeddings, limit=8, is_question=False, tr
         # weights. Those signals stay available for diagnostics in `match`/
         # SearchTrace, they just no longer determine the order.
         score=ce_score_by_id[cid] if ce_score_by_id is not None else rrf_scores[cid]*quality+(FILENAME_MATCH_BONUS if filename_match else ABBREVIATION_FILENAME_MATCH_BONUS if abbreviation_filename_match else 0.0)
+        # PR8.1.1 / PR8.1.2: additive entity name/path bonus. Both flags OFF →
+        # no-op (historical `match` keys only). Explicit tokens and subject
+        # aliases share one capped bonus; sources are logged in entity_match.
+        entity_detail=None
+        if ENTITY_MATCH_BONUS_ENABLED or SUBJECT_ENTITY_ALIAS_ENABLED:
+            entity_detail=entity_match_bonus.compute_entity_match_bonus(
+                query,row[0],row[1] or "",
+                include_explicit=ENTITY_MATCH_BONUS_ENABLED,
+                include_subject_aliases=SUBJECT_ENTITY_ALIAS_ENABLED,
+            )
+            score=score+entity_detail.bonus
+        # fts_hit remains PRIMARY-channel FTS only (unchanged meaning). PR5.1
+        # diagnostics (aux_hit / candidate_origin) are additive and only when
+        # the aux feature flag is on — OFF keeps the historical match keys.
         match={"fts_hit":fts_hit,"vector_hit":cid in vector_id_set,"semantic_similarity":max(similarity_by_id.get(cid,0.0),0.0),"filename_match":filename_match,"chunk_quality":quality}
+        if entity_detail is not None:
+            match["entity_match_bonus"]=entity_detail.bonus
+            match["entity_match"]=entity_detail.as_trace_dict()
+        # PR8.2: intent-gated revision score. Flag OFF → no-op. Non-intent
+        # queries also contribute 0 even when the flag is ON.
+        revision_detail=None
+        if REVISION_RANKING_ENABLED:
+            revision_detail=revision_ranking.compute_revision_score(query,row[0],row[1] or "")
+            score=score+revision_detail.bonus
+            match["revision_score"]=revision_detail.bonus
+            match["revision"]=revision_detail.as_trace_dict()
+        if AUXILIARY_TERM_COVERAGE_ENABLED:
+            aux_hit=cid in aux_matched_ids
+            match["aux_hit"]=aux_hit
+            match["candidate_origin"]=auxiliary_term_coverage.candidate_origin(
+                primary=fts_hit or cid in vector_id_set, aux_hit=aux_hit)
         if ce_score_by_id is not None: match["cross_encoder_score"]=ce_score_by_id[cid]
         # document_id/chunk_id are additive (EvidenceSet PR3). Ranking/score/
         # existing public fields are unchanged; callers that only read the
@@ -1553,8 +1687,12 @@ CONCISE_ANSWER_INSTRUCTIONS = HALLUCINATION_GUARD+"\n\n"+(
 JSON_ANSWER_GUARD = (
     "Jsi stavební asistent. Odpovídej výhradně česky a výhradně na základě dodaného kontextu ZDROJE - nic si nevymýšlej.\n"
     "Nevymýšlej technické požadavky, normy ani povinnosti, které nejsou doslova uvedené ve ZDROJÍCH.\n"
-    "Ke KAŽDÉ položce uveď 'zdroj_index' - celé číslo zdroje [n] z kontextu ZDROJE, ze kterého tvrzení doslova pochází. "
-    "Nikdy si zdroj nevymýšlej ani neuváděj číslo mimo rozsah uvedených ZDROJŮ.\n"
+    "Ke KAŽDÉ položce uveď 'zdroj_index' - 1-based číslo zdroje z kontextu ZDROJE, ze kterého tvrzení doslova pochází.\n"
+    "Platné hodnoty jsou pouze 1 až N, kde N je počet zdrojů zobrazených v sekci ZDROJE.\n"
+    "Příklad: [1] dokument A → zdroj_index: 1; [2] dokument B → zdroj_index: 2.\n"
+    "Nikdy nepoužívej 0, záporné číslo ani číslo větší než N. Hodnota 0 je neplatná.\n"
+    "Nepoužívej 0 jako „žádný zdroj“ ani jako odkaz na první dokument.\n"
+    "Pokud tvrzení nelze přiřadit ke konkrétnímu zdroji, takovou faktickou položku NEVYTVÁŘEJ.\n"
     "Pole 'typ' u každé položky vyjadřuje jistotu tvrzení:\n"
     "- \"fakt\" - doslovná informace ze zdroje\n"
     "- \"pozadavek\" - povinnost/podmínka uvedená ve zdroji\n"
@@ -1577,7 +1715,14 @@ _ANSWER_ITEM_SCHEMA = {
     "type": "object",
     "properties": {
         "text": {"type": "string", "description": "Konkrétní tvrzení, dokument nebo krok - jedna myšlenka."},
-        "zdroj_index": {"type": "integer", "description": "Číslo zdroje [n] z kontextu ZDROJE, ze kterého tvrzení pochází."},
+        "zdroj_index": {
+            "type": "integer",
+            "description": (
+                "1-based index zdroje z kontextu [1] až [N]. "
+                "Hodnota 0 je neplatná. Použij pouze index konkrétního zdroje, "
+                "který podporuje tuto položku."
+            ),
+        },
         "typ": {"type": "string", "enum": ["fakt", "pozadavek", "doporuceni"]},
     },
     "required": ["text", "zdroj_index", "typ"],
@@ -1640,6 +1785,14 @@ def _render_structured_answer(data, results):
     lines = ["Shrnutí:", f"- {str(data.get('shrnuti') or '').strip() or 'Nenalezeno v indexovaných dokumentech.'}", "", "Požadované dokumenty / kroky:", ""]
     used_indexes = set()
     areas = [a for a in (data.get("oblasti") or []) if isinstance(a, dict)]
+    # PR8.4.3: same override contract as _render_concise_answer, applied
+    # defensively here too even though STRUCTURED_ANSWER_SCHEMA has no
+    # official "nenalezeno" field today (bool(None) is False, so this is a
+    # no-op unless a future schema/prompt change adds one) — keeps both
+    # renderers symmetric under the same contract.
+    override_abstention = ABSTENTION_OVERRIDE_ENABLED and bool(data.get("nenalezeno"))
+    require_citation = CITATION_CONTRACT_ENABLED or override_abstention
+    any_valid_item = False
     for position, area in enumerate(areas, 1):
         name = str(area.get("nazev") or "").strip() or f"Oblast {position}"
         rendered_items = []
@@ -1648,6 +1801,10 @@ def _render_structured_answer(data, results):
             if not rendered:
                 continue
             prefix, text, index, document = rendered
+            # PR8.4.1: citation contract — same rule as _render_concise_answer.
+            if require_citation and not document:
+                continue
+            any_valid_item = True
             if index:
                 used_indexes.add(index)
             source_note = f" (Zdroj: {document})" if document else ""
@@ -1657,6 +1814,14 @@ def _render_structured_answer(data, results):
         lines.append(f"{position}. {name}")
         lines.extend(rendered_items)
         lines.append("")
+    # PR8.4.3: conflicting `nenalezeno` is ignored only when a surviving item
+    # exists; otherwise the sentinel wins.
+    # PR8.4.4: `shrnuti` is not a source of truth — the same "at least one
+    # surviving polozky item" rule decides whether a factual structured
+    # answer may be shown at all. Flag OFF → this branch is a no-op and
+    # `shrnuti` is emitted even when every item was dropped (pre-PR8.4.4).
+    if (override_abstention or STRUCTURED_SUMMARY_CITATION_ENABLED) and not any_valid_item:
+        return "Nenalezeno v indexovaných dokumentech."
     missing = [str(m).strip() for m in (data.get("nenalezene") or []) if str(m).strip()]
     lines.append("Nenalezené informace:")
     lines.extend(f"- {m}" for m in missing) if missing else lines.append("- Žádné")
@@ -1669,19 +1834,97 @@ def _render_structured_answer(data, results):
     return "\n".join(lines).strip()
 
 def _render_concise_answer(data, results):
-    if data.get("nenalezeno"):
+    # PR8.4.3: abstention override — a model-declared `nenalezeno` is only
+    # trusted when no item in the same response resolves to real evidence.
+    # Citation is enforced UNCONDITIONALLY for this decision (independent of
+    # CITATION_CONTRACT_ENABLED's own, separate default) — an explicit "not
+    # found" signal must not be overridden by anything less than a genuinely
+    # cited claim. Flag OFF (or no `nenalezeno`) → identical to pre-PR8.4.3.
+    override_abstention = ABSTENTION_OVERRIDE_ENABLED and bool(data.get("nenalezeno"))
+    if data.get("nenalezeno") and not override_abstention:
         return "Nenalezeno v indexovaných dokumentech."
+    # PR8.4.1: citation contract — a claim item whose zdroj_index never
+    # resolved to a real result row has no verifiable source and must not
+    # survive rendering. Flag OFF keeps the pre-PR8.4.1 behaviour (item kept,
+    # just missing its "(Zdroj: ...)" note) UNLESS the override above already
+    # forces citation regardless of the flag.
+    require_citation = CITATION_CONTRACT_ENABLED or override_abstention
     blocks = []
     for item in data.get("body") or []:
         rendered = _render_answer_item(item, results)
         if not rendered:
             continue
         prefix, text, _index, document = rendered
+        if require_citation and not document:
+            continue
         block = f"{prefix}{text}"
         if document:
             block += f"\n(Zdroj: {document})"
         blocks.append(block)
     return "\n\n".join(blocks) if blocks else "Nenalezeno v indexovaných dokumentech."
+
+_FALLBACK_SENTINEL = "Nenalezeno v indexovaných dokumentech."
+
+def _fallback_text_has_pool_source(text, results):
+    """PR8.4.6: does unconstrained fallback prose mention a pool document?
+
+    Filename substring match after the same ASCII-fold used by
+    `benchmark.answer_evidence` / `_fold_plain`. Deliberately not an NLI
+    check — a real name from `results` in the text is enough to keep the
+    fallback; anything else (empty, the not-found sentinel, a name that is
+    not in the pool) is not a verifiable source.
+    """
+    body = (text or "").strip()
+    if not body:
+        return False
+    folded = _fold_plain(body)
+    if folded == _fold_plain(_FALLBACK_SENTINEL):
+        return False
+    for row in results or ():
+        name = str((row or {}).get("document") or "").strip()
+        if name and _fold_plain(name) in folded:
+            return True
+    return False
+
+def _answer_item_has_text(item):
+    """True when a model JSON item attempted a non-empty claim (`text`)."""
+    if not isinstance(item, dict):
+        return False
+    return bool(str(item.get("text") or "").strip())
+
+def _json_payload_has_substantive_answer_item(data):
+    """Did the parsed JSON try to answer with at least one claim item?
+
+    Counts concise `body` items and structured `oblasti[].polozky` items
+    that have non-empty `text`. Ignores `shrnuti`, `nenalezene`, empty
+    items, and other metadata — those must not trigger PR9.2.1 fallback.
+    """
+    if not isinstance(data, dict):
+        return False
+    for item in data.get("body") or []:
+        if _answer_item_has_text(item):
+            return True
+    for area in data.get("oblasti") or []:
+        if not isinstance(area, dict):
+            continue
+        for item in area.get("polozky") or []:
+            if _answer_item_has_text(item):
+                return True
+    return False
+
+def _apply_free_text_fallback(query, context, answer_results, checklist, model):
+    """One unconstrained Ollama call + the PR8.4.6 filename contract.
+
+    Shared by the JSON-exception branch and PR9.2.1 (JSON rendered to
+    sentinel despite substantive items). Raises if the fallback call itself
+    fails — callers decide whether that is 'Ollama nedostupná' (exception
+    path) or 'keep the JSON sentinel' (PR9.2.1 path).
+    """
+    instructions=STRUCTURED_ANSWER_INSTRUCTIONS if checklist else CONCISE_ANSWER_INSTRUCTIONS
+    rendered=_call_ollama(model,f"{instructions}\n\nDOTAZ: {query}\n\nZDROJE:\n{context}").strip()
+    if FALLBACK_CITATION_CONTRACT_ENABLED and not _fallback_text_has_pool_source(rendered, answer_results):
+        rendered=_FALLBACK_SENTINEL
+    return rendered
 
 # Mirrors ui_services.DEEP_ANALYSIS_KEYWORDS by design (ai_search.py must stay
 # independent of the ui_services application layer, so this is intentionally a
@@ -1762,6 +2005,193 @@ def _answer_confidence(query, results):
             reason=" ".join(downgrade_notes)
     return level,reason
 
+# --- PR6/PR7.3: DocumentState answer safety gate --------------------------
+# Deterministic, filename/path-only guard against the "SIGNED contract exists
+# in `results` but the LLM answer denies it" failure class (see the HAUS365
+# audit: SOD_HAUS365_NDS_k el. podpisu_podepsané.pdf ranked #1, answer wrongly
+# said "není podepsaná" citing an unrelated TP document instead).
+#
+# Runs AFTER the LLM answer is rendered and BEFORE it is returned to the
+# caller - it only rewrites `rendered` text when a forbidden claim pattern is
+# detected; an already-compliant answer passes through byte-identical. It
+# NEVER touches retrieval, RRF, scoring, ranking, or `results` order - see
+# document_state.py's own docstring for the same guarantee at the
+# classification layer. State decisions are 100% rule-based - no LLM is
+# consulted for the state itself, only for the free-text answer being validated.
+#
+# PR7.3 split this in two: the state DECISION moved out to
+# evidence_runtime.build_state_coverage() (via _answer_state_coverage below),
+# leaving the gate with text policy only. The regexes below are therefore the
+# gate's whole remaining domain - what the answer CLAIMS - while what is TRUE
+# comes from one StateCoverage shared with the diagnostic layer.
+def _fold_plain(text):
+    """ASCII-folded casefold, same normalization document_state.py uses
+    internally (duplicated here - see CHECKLIST_QUERY_KEYWORDS above for the
+    established precedent of small, self-contained duplication across this
+    module boundary rather than exposing a private helper as public API)."""
+    return "".join(
+        c for c in unicodedata.normalize("NFKD", (text or "").casefold())
+        if not unicodedata.combining(c)
+    )
+
+# PR6.2 fix: the original {0,80}-char lookahead window was far too wide - it
+# flagged epistemic hedges ("není UVEDENO, ZDA byla smlouva podepsána") as a
+# hard negative claim, because "neni" and "podeps" both occurred somewhere in
+# the same sentence regardless of what stood between them. Replaced with a
+# tight, phrase-adjacent pattern list (word(s) immediately before "podepsan"),
+# which naturally excludes hedges - "zda byla ... podepsana" never matches
+# because "zda"/"uvedeno"/"smlouva" sit directly between the trigger word and
+# "podepsan", breaking the required adjacency - with no separate denylist
+# needed for "není uvedeno, zda...", "nelze ověřit, zda...", "není jasné, zda...".
+_STATE_GATE_NEGATIVE_SIGNED_PATTERNS = (
+    r"\bneni\b\s+podepsan\w*",
+    r"\bnebyla\b\s+podepsan\w*",
+    r"\bnebyl\b\s+podepsan\w*",
+    r"\bnejsou\b\s+podepsan\w*",
+    r"\bneexistuje\b\s+podepsan\w*",
+    r"\bnenas\w*\s+jsem\s+podepsan\w*",  # "nenašel/nenašla jsem podepsanou"
+    r"\bnenalez\w*\s+jsem\s+podepsan\w*",  # "nenalezl/nenalezla jsem podepsanou"
+    r"\bnepodarilo\s+se\s+najit\s+podepsan\w*",  # "nepodařilo se najít podepsanou"
+)
+_STATE_GATE_NEGATIVE_SIGNED_RE = re.compile("|".join(_STATE_GATE_NEGATIVE_SIGNED_PATTERNS))
+_STATE_GATE_GENERIC_NOT_FOUND_RE = re.compile(r"nenalezeno v indexovanych dokumentech")
+_STATE_GATE_POSITIVE_SIGNED_PATTERNS = (
+    r"\bje\b\s+podepsan\w*",
+    r"\bjsou\b\s+podepsan\w*",
+    r"\bbyla\b\s+podepsan\w*",
+    r"\bbyl\b\s+podepsan\w*",
+    r"\bexistuje\b\s+podepsan\w*",
+)
+_STATE_GATE_POSITIVE_SIGNED_RE = re.compile("|".join(_STATE_GATE_POSITIVE_SIGNED_PATTERNS))
+
+
+def _answer_state_coverage(query, results):
+    """THE single lifecycle-state decision for one answered query (PR7.3).
+
+    Before this, ai_search made that decision twice: the PR6 gate had its own
+    _document_state_outcome() and the PR7.2 diagnostic layer independently built
+    a StateCoverage. The two used different entity-matching rules, so they could
+    disagree on the same query - two answers to "is this contract signed?" in one
+    process. evidence_runtime.build_state_coverage() is now the only one, and
+    both consumers read it.
+
+    Pure w.r.t. document_state's pure functions: `results` is read-only input,
+    never reordered, filtered, or rescored - it is read here only to classify
+    filenames, never to influence ranking.
+    """
+    from evidence_runtime import build_state_coverage
+    return build_state_coverage(
+        document_state.derive_state_requirement(query),
+        [
+            document_state.classify_document_state(
+                row.get("document", ""), row.get("path", "") or "", row.get("document_id"),
+            )
+            for row in results
+        ],
+    )
+
+
+def _apply_document_state_answer_gate(state_coverage, rendered):
+    """Rewrite `rendered` only when it contradicts `state_coverage`; otherwise
+    return it byte-identical.
+
+    PR7.3: the gate is now a pure CONSUMER of one verdict. It receives neither
+    `query` nor `results`, which is what structurally guarantees the properties
+    PR7.3 required - it cannot parse the query, classify a filename, or do its
+    own entity matching, because it has no access to any of those inputs. Its
+    only remaining job is text: decide whether the rendered answer makes a claim
+    the verdict forbids, and if so replace it.
+
+    Verdict → claim policy:
+      SIGNED_CONFIRMED / SIGNED_CONTRACT_CONFIRMED
+                         a negative claim is false        → positive rewrite
+      SIGNED_OTHER_DOCUMENT_CONFIRMED
+                         a positive "podepsaná smlouva" claim is false
+                         (only a signed LOI/order/… exists) → clarify rewrite
+      UNSIGNED_CONFIRMED a positive claim is false        → negative rewrite
+      ENTITY_MISMATCH    neither direction is supported   → "neověřeno"
+      UNVERIFIED         the state cannot be ruled out    → "neověřeno" (hedge)
+      NOOP               no signed intent                 → untouched
+
+    Minimal intervention throughout: an answer that makes no claim about
+    signedness at all is returned unchanged under EVERY verdict. Forcing a
+    "neověřeno" sentence onto an answer that never mentioned a signature would
+    destroy a useful answer to a question the gate was not asked to police.
+    """
+    from evidence_runtime import StateVerdict
+
+    verdict = state_coverage.verdict
+    if verdict is StateVerdict.NOOP:
+        return rendered
+
+    folded = _fold_plain(rendered)
+    has_negative = bool(
+        _STATE_GATE_NEGATIVE_SIGNED_RE.search(folded)
+        or _STATE_GATE_GENERIC_NOT_FOUND_RE.search(folded)
+    )
+    has_positive = bool(_STATE_GATE_POSITIVE_SIGNED_RE.search(folded))
+    docs = ", ".join(sorted({ev.document for ev in state_coverage.evidences}))
+
+    if verdict in (StateVerdict.SIGNED_CONFIRMED, StateVerdict.SIGNED_CONTRACT_CONFIRMED):
+        if not has_negative:
+            return rendered
+        return (
+            f"Ano - na boxu je podepsaná smlouva. Nalezený podepsaný dokument: {docs}.\n"
+            f"(Zdroj: {docs})"
+        )
+
+    if verdict is StateVerdict.SIGNED_OTHER_DOCUMENT_CONFIRMED:
+        # PR7.6.1: signed LOI/order/minutes ≠ signed SoD. Always rewrite to the
+        # clarifying sentence — a silent pass-through would leave an LLM claim
+        # like "podepsaná smlouva existuje" standing on LOI evidence alone.
+        kind_hint = docs or "jiný dokument"
+        return (
+            f"Nalezl jsem podepsaný dokument ({kind_hint}), ale ne potvrzenou "
+            f"podepsanou smlouvu.\n(Zdroj: {docs})"
+            if docs else
+            "Nalezl jsem podepsaný dokument, ale ne potvrzenou podepsanou smlouvu."
+        )
+
+    if verdict is StateVerdict.UNSIGNED_CONFIRMED:
+        # Every candidate is conclusively FOR_SIGNATURE/DRAFT/TEMPLATE, so a
+        # negative claim is accurate and passes through untouched - only a false
+        # POSITIVE ("je podepsaná") needs correcting.
+        if has_positive and not has_negative:
+            return (
+                "Ne - na boxu nebyla nalezena podepsaná verze smlouvy; k dispozici je "
+                f"pouze nepodepsaná verze.\n(Zdroj: {docs})"
+            )
+        return rendered
+
+    # ENTITY_MISMATCH / UNVERIFIED: no definite claim in either direction may
+    # stand. The two differ only in what may be cited, which `docs` already
+    # encodes - ENTITY_MISMATCH and a partial-entity-match UNVERIFIED both carry
+    # no citable evidence, because naming a document there would itself be the
+    # fabricated confirmation/denial this gate exists to prevent (PR6.1).
+    #
+    # PR7.6.1: with *no* citable evidence, also block invented technical answers
+    # that never mention signedness (FAT status-01: BOZP analysis from an
+    # unrelated SoD). Genuine hedges ("není uvedeno" / "nelze ověřit") still
+    # pass — minimal intervention for already-safe text.
+    if not docs:
+        already_hedged = any(
+            marker in folded
+            for marker in ("nelze", "neni uvedeno", "neover", "nenalezen")
+        )
+        if already_hedged and not (has_negative or has_positive):
+            return rendered
+        return (
+            "Nelze jednoznačně ověřit stav podpisu smlouvy pro dotazovaný "
+            "subjekt - nalezené dokumenty se k němu jednoznačně nevztahují."
+        )
+    if not (has_negative or has_positive):
+        return rendered
+    return (
+        "Nelze jednoznačně ověřit, zda je smlouva podepsaná - nalezený dokument "
+        f"nemá v názvu ani dostupných datech jednoznačný signál o stavu podpisu.\n"
+        f"(Zdroj: {docs})"
+    )
+
 def _call_ollama(model, prompt, format_schema=None, timeout=240):
     payload={"model":model,"stream":False,"think":False,"prompt":prompt}
     if format_schema is not None: payload["format"]=format_schema
@@ -1769,12 +2199,217 @@ def _call_ollama(model, prompt, format_schema=None, timeout=240):
     with urllib.request.urlopen(req,timeout=timeout) as response:
         return json.loads(response.read())["response"]
 
+# --- PR7.2: Evidence Runtime Validation as a DIAGNOSTIC layer -----------------
+#
+# WHY THIS EXISTS: the foundation layers (EvidenceSet PR3, IntentRequirement PR4,
+# DocumentState W1, StateCoverage/needs PR7.0.1) are fully tested but nothing in
+# the runtime ever ran them together over a real answer. This wiring makes their
+# verdict OBSERVABLE on production queries before any of it is allowed to change
+# an answer.
+#
+# It is strictly read-only: it renders no text, rewrites nothing, and adds one
+# additive key to answer()'s return dict. `results` is read but never reordered,
+# filtered, scored, or mutated - retrieval, RRF, rerank, bonuses, QE and the
+# prompt are untouched by construction (no call into any of them below).
+#
+# The PR6 gate is deliberately NOT refactored to use build_state_coverage()
+# (that is PR7.3). The two entity-matching rules differ - PR6 accepts any single
+# entity token as a substring, PR7.0.1 requires every discriminative term - so
+# for some queries `state_verdict` here and the gate's own outcome will disagree.
+# Surfacing that disagreement on real queries is the point of this PR; resolving
+# it is the next one.
+
+def _validation_retrieval_rows(results):
+    """Rows for build_evidence_set(), preferring PR7.1's chunk-level capture.
+
+    `_evidence_spans` (ui_services.search_all, flag-gated) carries one entry per
+    chunk that actually contributed to a document's merged quote, with real
+    document_id/chunk_id. Facet evidence is then attributed per chunk instead of
+    to one concatenated quote whose parts came from different chunks.
+
+    Without the capture the merged rows are the only thing available. That is a
+    coarser but still honest input - identity comes from the best chunk of the
+    document and the quote is what the LLM was given - so the layer degrades
+    instead of going silent. `span_source` records which one was used, because
+    the two are not equally precise and a diagnostic must not hide that.
+    """
+    spans = [span for row in results for span in (row.get("_evidence_spans") or ())]
+    if spans:
+        return spans, "captured_spans"
+    return list(results), "merged_rows"
+
+
+def _answer_validation_metadata(query, results, gate_rewrote=False, state_coverage=None):
+    """Build an AnswerValidation for one answered query and summarize it.
+
+    `state_coverage` is passed in when the gate already computed it, so the same
+    verdict the gate acted on is the one reported here (PR7.3 - previously these
+    were two independent decisions that could disagree).
+
+    Local imports keep the default-OFF path from paying any import cost - the
+    same convention ui_services._multi_query_search_plan() uses for facets, and
+    it matters here because ai_search is imported by the parsing worker
+    subprocesses too.
+
+    Returns a JSON-serializable dict of scalars/lists only: it travels into
+    answer()'s result, which app.py and the benchmark harness both serialize.
+    """
+    from evidence import build_evidence_set
+    from evidence_runtime import (
+        AnswerValidation, GateAction, derive_evidence_needs, evaluate_evidence_safety,
+    )
+    from intent_requirements import build_evidence_coverage, derive_intent_requirement
+    from query_facets import extract_facets
+
+    facets = extract_facets(query)
+    rows, span_source = _validation_retrieval_rows(results)
+    evidence_set = build_evidence_set(query, retrieval_rows=rows, facets=facets)
+    intent_coverage = build_evidence_coverage(
+        derive_intent_requirement(query, facets),
+        derive_evidence_needs(evidence_set.spans),
+    )
+    if state_coverage is None:
+        state_coverage = _answer_state_coverage(query, results)
+    evidence_safety = evaluate_evidence_safety(query, results)
+    validation = AnswerValidation(
+        query=query,
+        facets=tuple(facets),
+        evidence_set=evidence_set,
+        intent_coverage=intent_coverage,
+        state_coverage=state_coverage,
+        evidence_safety=evidence_safety,
+        # This layer never rewrites; a non-PASSTHROUGH value reports what the
+        # gate did. Since PR7.3 the gate acts on this very StateCoverage, so the
+        # direction named here is the one it actually applied, not a guess.
+        gate_action=_validation_gate_action(state_coverage.verdict) if gate_rewrote else GateAction.PASSTHROUGH,
+    )
+    return _validation_summary(validation, span_source)
+
+
+def _validation_gate_action(verdict):
+    from evidence_runtime import GateAction, StateVerdict
+    if verdict in (StateVerdict.SIGNED_CONFIRMED, StateVerdict.SIGNED_CONTRACT_CONFIRMED):
+        return GateAction.REWRITTEN_POSITIVE
+    if verdict is StateVerdict.UNSIGNED_CONFIRMED:
+        return GateAction.REWRITTEN_NEGATIVE
+    if verdict is StateVerdict.SIGNED_OTHER_DOCUMENT_CONFIRMED:
+        return GateAction.REWRITTEN_UNVERIFIED
+    return GateAction.REWRITTEN_UNVERIFIED
+
+
+def _validation_summary(validation, span_source):
+    """Flatten AnswerValidation into diagnostic metadata.
+
+    Only aggregates and document names - never chunk text. This dict is attached
+    to every answer when the flag is on, and duplicating quotes into it would
+    grow the payload without telling a reader anything `citations` does not.
+    """
+    state = validation.state_coverage
+    intent = validation.intent_coverage
+    evidence_set = validation.evidence_set
+    safety = validation.evidence_safety
+    out = {
+        # PR7.3.1: symmetric with the FAILED payload in answer(), so a consumer
+        # can branch on one field instead of probing for an "error" key.
+        "status": "OK",
+        "rules_version": validation.source,
+        "span_source": span_source,
+        "evidence_spans": len(evidence_set.spans),
+        "facet_join_status": evidence_set.join_status.value,
+        "state_verdict": state.verdict.value,
+        "state_entity_matched": state.entity_matched,
+        "state_documents": [
+            {"document": ev.document, "state": ev.state.value, "confidence": ev.confidence}
+            for ev in state.evidences
+        ],
+        "intent_coverage": intent.status.value,
+        "required_needs": [need.value for need in intent.required_needs],
+        "satisfied_needs": [need.value for need in intent.satisfied_needs],
+        "missing_needs": [need.value for need in intent.missing_needs],
+        "gate_action": validation.gate_action.value,
+    }
+    if safety is not None:
+        out["evidence_safety"] = safety.status.value
+        out["conflicted_documents"] = list(safety.conflicted_documents)
+    return out
+
+
 def answer(query, results):
     if not results: return {"answer":"Odpověď nelze vytvořit bez citací.","citations":[],"confidence":"red"}
-    confidence_level,confidence_reason=_answer_confidence(query,results)
+    # PR8.3: demote OLD/ rows from authoritative context on currency/status
+    # queries. Flag OFF → answer_results IS results (same object, not just
+    # equal) — byte-identical AND identity-identical to pre-PR8.3. search()
+    # is untouched; this only chooses which rows the LLM / citations / state
+    # gate may treat as current evidence. Historical OLD copies stay on an
+    # additive `historical_citations` key.
+    #
+    # PR8.4.1: a copy (`list(...)`) is made ONLY where a real transformation
+    # happens (guard actually demoted something) or where the transformed
+    # result had to be discarded (error / empty). Every other path keeps
+    # `results` itself so `final["citations"] is results` still holds for
+    # callers that never trigger the guard — this was a latent PR8.3
+    # regression (identity, not value, broke) surfaced by PR8.4 test runs.
+    answer_results=results
+    historical_citations=[]
+    old_guard_trace=None
+    if OLD_REVISION_GUARD_ENABLED:
+        try:
+            guard=old_revision_guard.apply_old_revision_guard(query,results)
+            old_guard_trace=guard.as_trace_dict()
+            if guard.historical_results:
+                answer_results=list(guard.context_results)
+                historical_citations=old_revision_guard.annotate_historical(guard.historical_results)
+        except Exception as exc:
+            _search_logger.warning("OLD_REVISION_GUARD_SKIPPED query=%r error=%r - using original results",query,exc)
+            answer_results=results; historical_citations=[]; old_guard_trace={"activated":False,"reason":"error","error":repr(exc)}
+    if not answer_results:
+        answer_results=results; historical_citations=[]
+    confidence_level,confidence_reason=_answer_confidence(query,answer_results)
     confidence_block=f"\n\nJistota odpovědi:\n{CONFIDENCE_LABELS[confidence_level]}\n- {confidence_reason}"
+    # PR7.6.1: evidence-safety abstention (project conflict / weak lexical
+    # overlap). Decision lives in evidence_runtime.evaluate_evidence_safety —
+    # answer() only consumes it. Runs only when the validation flag is on so
+    # the flag-OFF path stays byte-identical to pre-PR7.6.1. When it abstains
+    # we skip the LLM entirely: a factual claim must not be invented from a
+    # trap file or a generic-token near-miss.
+    evidence_safety=None
+    if EVIDENCE_RUNTIME_VALIDATION_ENABLED:
+        try:
+            from evidence_runtime import EvidenceSafetyStatus, evaluate_evidence_safety
+            evidence_safety=evaluate_evidence_safety(query,answer_results)
+            if evidence_safety.status in (
+                EvidenceSafetyStatus.NO_EVIDENCE,
+                EvidenceSafetyStatus.DOCUMENT_PROJECT_CONFLICT,
+                EvidenceSafetyStatus.UNVERIFIED,
+            ) and evidence_safety.message:
+                # Never hand conflicted / irrelevant rows back as citable
+                # evidence — the abstention text must stand alone.
+                safe_citations=[]
+                final={"answer":evidence_safety.message+confidence_block,"citations":safe_citations,"model":DEFAULT_MODEL,"confidence":confidence_level}
+                try: final["validation"]=_answer_validation_metadata(query,answer_results,False,None)
+                except Exception as exc:
+                    _search_logger.warning("VALIDATION_FAILED query=%r error=%r - answer unaffected",query,exc)
+                    final["validation"]={"error":f"{type(exc).__name__}: {exc}","source":"evidence_runtime","status":"FAILED"}
+                return final
+        except Exception as exc:
+            _search_logger.warning("EVIDENCE_SAFETY_SKIPPED query=%r error=%r - continuing to LLM",query,exc)
+            evidence_safety=None
+    # PR9.3.3: pack ZDROJE after OLD guard + evidence gate, before the LLM.
+    # Flag OFF → llm_results is answer_results (same object). Retrieval,
+    # citations, document-state, and model routing stay on the full pool.
+    llm_results=answer_results
+    packed_debug=None
+    if QUERY_FOCUSED_CONTEXT_PACKING_ENABLED:
+        try:
+            packed=context_packing.pack_answer_context(query,answer_results)
+            if packed.rows:
+                llm_results=packed.rows
+                packed_debug=packed.as_debug_dict()
+        except Exception as exc:
+            _search_logger.warning("CONTEXT_PACKING_SKIPPED query=%r error=%r - using full answer_results",query,exc)
+            llm_results=answer_results; packed_debug=None
     checklist=_is_checklist_query(query)
-    context="\n\n".join(f"[{i}] {r['document']}"+(f" (sekce: {r['heading']})" if r.get("heading") else "")+f" | projekt {r['project']}\n{r['quote']}" for i,r in enumerate(results,1)); model=COMPLEX_MODEL if len(query)>180 or len(results)>6 else DEFAULT_MODEL
+    context="\n\n".join(f"[{i}] {r['document']}"+(f" (sekce: {r['heading']})" if r.get("heading") else "")+f" | projekt {r['project']}\n{r['quote']}" for i,r in enumerate(llm_results,1)); model=COMPLEX_MODEL if len(query)>180 or len(answer_results)>6 else DEFAULT_MODEL
     guidance=STRUCTURED_JSON_GUIDANCE if checklist else CONCISE_JSON_GUIDANCE
     schema=STRUCTURED_ANSWER_SCHEMA if checklist else CONCISE_ANSWER_SCHEMA
     # The structured JSON path (format=schema) is preferred, but constrained
@@ -1786,17 +2421,77 @@ def answer(query, results):
     # to the same free-text prompt/instructions used before this feature existed,
     # with the same `context`/`results`, so a slow or non-conforming response
     # degrades to the old behaviour instead of surfacing as "Ollama je nedostupná".
+    json_data=None
     try:
         raw=_call_ollama(model,f"{guidance}\n\nDOTAZ: {query}\n\nZDROJE:\n{context}",format_schema=schema)
-        data=json.loads(raw)
-        rendered=_render_structured_answer(data,results) if checklist else _render_concise_answer(data,results)
+        json_data=json.loads(raw)
+        rendered=_render_structured_answer(json_data,llm_results) if checklist else _render_concise_answer(json_data,llm_results)
     except Exception:
-        instructions=STRUCTURED_ANSWER_INSTRUCTIONS if checklist else CONCISE_ANSWER_INSTRUCTIONS
         try:
-            rendered=_call_ollama(model,f"{instructions}\n\nDOTAZ: {query}\n\nZDROJE:\n{context}").strip()
+            rendered=_apply_free_text_fallback(query,context,llm_results,checklist,model)
         except Exception as exc2:
-            return {"answer":f"Ollama je nedostupná: {type(exc2).__name__}. Nalezené citace zůstávají k dispozici.","citations":results,"model":model,"error":str(exc2),"confidence":confidence_level}
-    final={"answer":rendered+confidence_block,"citations":results,"model":model,"confidence":confidence_level}
+            return {"answer":f"Ollama je nedostupná: {type(exc2).__name__}. Nalezené citace zůstávají k dispozici.","citations":answer_results,"model":model,"error":str(exc2),"confidence":confidence_level}
+    else:
+        # PR9.2.1: JSON parsed and rendered, but citation contract dropped
+        # every substantive item (typically zdroj_index=0) → sentinel. That
+        # is not an exception, so the branch above never ran. Flag OFF →
+        # keep the sentinel (byte-identical to pre-PR9.2.1). Flag ON → the
+        # same free-text fallback as the exception path, still gated by
+        # PR8.4.6. Explicit abstention (no substantive items) stays sentinel.
+        # A failed fallback call must NOT replace the JSON sentinel with
+        # "Ollama je nedostupná" — JSON already produced a safe answer.
+        if (JSON_SENTINEL_FALLBACK_ENABLED
+                and rendered == _FALLBACK_SENTINEL
+                and _json_payload_has_substantive_answer_item(json_data)):
+            try:
+                rendered=_apply_free_text_fallback(query,context,llm_results,checklist,model)
+            except Exception as exc:
+                _search_logger.warning("JSON_SENTINEL_FALLBACK_SKIPPED query=%r error=%r - keeping JSON sentinel",query,exc)
+                rendered=_FALLBACK_SENTINEL
+    # PR6/PR6.2: deterministic signed-contract safety gate - rewrites `rendered`
+    # only if it violates the DocumentState rule; a no-op for every query
+    # without a signed-contract intent (see _document_state_outcome). Runs
+    # after both the structured and free-text fallback paths so either one is
+    # covered. Feature-flagged (default OFF, consistent with the AUX pattern):
+    # when disabled, answer() behaviour is byte-identical to pre-PR6.
+    # Pre-gate text, kept only when BOTH flags are on, so the diagnostic layer
+    # below can report whether the gate rewrote the answer.
+    pre_gate=rendered if (DOCUMENT_STATE_GATE_ENABLED and EVIDENCE_RUNTIME_VALIDATION_ENABLED) else None
+    # PR7.3: one state decision, computed here only for the gate. When only the
+    # diagnostic flag is on it is computed inside _answer_validation_metadata()
+    # instead, i.e. under that function's try/except.
+    #
+    # PR7.3.1: neither the state decision nor the gate may destroy an answer. On
+    # failure `rendered` keeps its pre-gate value - exactly what the flag-OFF
+    # path returns - so the user still gets their answer, and the gate
+    # deliberately does NOT fire: an unknown state cannot justify rewriting a
+    # claim. Logged like CROSS_ENCODER_FALLBACK above, so a swallowed failure
+    # still leaves a trace when diagnostics are off.
+    state_coverage=None
+    if DOCUMENT_STATE_GATE_ENABLED:
+        try:
+            state_coverage=_answer_state_coverage(query,answer_results)
+            rendered=_apply_document_state_answer_gate(state_coverage,rendered)
+        except Exception as exc:
+            _search_logger.warning("STATE_GATE_SKIPPED query=%r error=%r - answer passes through ungated",query,exc)
+    final={"answer":rendered+confidence_block,"citations":answer_results,"model":model,"confidence":confidence_level}
+    if historical_citations:
+        final["historical_citations"]=historical_citations
+    # PR7.2 diagnostics: additive `validation` key, nothing else. Never raises -
+    # a failure in a read-only diagnostic must not cost the user their answer.
+    # Reuses the gate's `state_coverage` when both flags are on, so the verdict
+    # reported here is provably the one the gate acted on (PR7.3).
+    if EVIDENCE_RUNTIME_VALIDATION_ENABLED:
+        try: final["validation"]=_answer_validation_metadata(query,answer_results,pre_gate is not None and pre_gate!=rendered,state_coverage)
+        except Exception as exc:
+            _search_logger.warning("VALIDATION_FAILED query=%r error=%r - answer unaffected",query,exc)
+            final["validation"]={"error":f"{type(exc).__name__}: {exc}","source":"evidence_runtime","status":"FAILED"}
+        if old_guard_trace is not None and isinstance(final.get("validation"), dict):
+            final["validation"]["old_revision_guard"]=old_guard_trace
+        if packed_debug is not None and isinstance(final.get("validation"), dict):
+            final["validation"]["context_packing"]=packed_debug
+    if packed_debug is not None:
+        final["_packed_context_debug"]=packed_debug
     return final
 
 def main():

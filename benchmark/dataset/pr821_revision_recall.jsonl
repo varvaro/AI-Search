@@ -1,0 +1,12 @@
+# dataset_version: 0.1.0-pr821
+#
+# PR8.2.1 — Revision-aware candidate recall (pool membership, not ranking).
+# expected_in_pool: name/path substrings that must appear among Phase-3 candidates
+# when REVISION_RECALL_ENABLED is ON and the query has revision intent.
+#
+{"id": "pr821-hmg-aktualni-pool", "query": "najdi aktuální harmonogram stavby", "type": "positive_pool", "expected_in_pool": ["_akt_4.08.2026", "akt_4.08.2026", "HMG"], "forbidden_in_pool_auto": [], "notes": "current HMG must enter candidate pool"}
+{"id": "pr821-sod-final-pool", "query": "poslední SoD FERI monolit final", "type": "positive_pool", "expected_in_pool": ["/final/", "NOT251110"], "forbidden_in_pool_auto": [], "notes": "final SoD path available in pool"}
+{"id": "pr821-hmg-platny-pool", "query": "jaký harmonogram platí pro monolit?", "type": "positive_pool", "expected_in_pool": ["_akt_4.08.2026", "HMG"], "forbidden_in_pool_auto": [], "notes": "platí intent recalls HMG"}
+{"id": "pr821-control-no-intent", "query": "harmonogram stavby Garáže Smíchov", "type": "control_no_intent", "expected_in_pool": [], "forbidden_in_pool_auto": [], "notes": "no revision intent → candidate list identical flag ON vs OFF"}
+{"id": "pr821-control-ordinary", "query": "ALPHA unikátní fulltextový výraz", "type": "control_ordinary", "expected_in_pool": [], "forbidden_in_pool_auto": [], "notes": "ordinary query byte-identical (production may miss ALPHA; identity still checked)"}
+{"id": "pr821-old-not-auto", "query": "najdi aktuální výkres výztuže 3.PP", "type": "negative_old", "expected_in_pool": [], "forbidden_in_pool_auto": ["/OLD/", "/old/"], "notes": "OLD paths must not be auto-appended by revision recall"}

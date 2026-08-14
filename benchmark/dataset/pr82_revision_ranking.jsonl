@@ -1,0 +1,12 @@
+# dataset_version: 0.1.0-pr82
+#
+# PR8.2 — Revision-aware ranking cases (ND Smíchov).
+# Positive cases use revision-intent queries; controls verify non-intent identity
+# and that OLD/draft are not rewarded under "aktuální/platný".
+#
+{"id": "pr82-hmg-aktualni", "query": "najdi aktuální harmonogram stavby", "type": "positive", "expected_contains": ["_akt_4.08.2026", "akt_4.08.2026"], "forbidden_top5": ["_akt.08.12.25_R1", "_akt.08.12.25_R2", "/old/", "/OLD/"], "notes": "current HMG R3 akt_4.08.2026"}
+{"id": "pr82-hmg-platny", "query": "jaký harmonogram platí pro monolit?", "type": "positive", "expected_contains": ["_akt_4.08.2026", "akt_4.08.2026"], "forbidden_top5": ["vyhodnocení 18.7.2025", "Hmg SIS - Garáže Smíchov_14.8.24", "/old/"], "notes": "platí = current HMG"}
+{"id": "pr82-sod-posledni", "query": "poslední SoD FERI monolit final", "type": "positive", "expected_contains": ["/final/", "NOT251110"], "forbidden_top5": ["návrh", "navrh", "/old/"], "notes": "poslední SoD in final/"}
+{"id": "pr82-hmg-starsi-control", "query": "harmonogram stavby Garáže Smíchov", "type": "control_no_intent", "expected_contains": [], "forbidden_top5": [], "notes": "no revision intent → ranking must match baseline byte-for-byte scores order when only revision flag differs"}
+{"id": "pr82-old-not-boosted", "query": "najdi aktuální výkres výztuže 3.PP", "type": "negative_old", "expected_contains": [], "forbidden_top5": ["/OLD/", "/old/"], "notes": "aktuální must not prefer OLD/ D.1.2.07"}
+{"id": "pr82-rev-compare-control", "query": "porovnání revizí harmonogramu R1 R2 R3", "type": "control_no_intent", "expected_contains": [], "forbidden_top5": [], "notes": "porovnání without aktuální/platný → no revision score"}

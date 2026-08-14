@@ -51,6 +51,13 @@ class EvidenceSpan:
     subquery_ids: tuple[str, ...]
     matched_terms: tuple[str, ...]
     score: float = 0.0
+    # PR7.1, additive: the QueryFacet objects whose terms were verified in this
+    # span's `quote`. `facet_types` keeps only the type, which discards the two
+    # attributes a consumer needs to weigh a match — `source` (exact vocabulary
+    # hit vs. residual span) and `confidence` (1.0 / 0.8 / 0.6). Defaults to ()
+    # so every existing constructor call and positional usage keeps working;
+    # `facet_types` is unchanged and remains the coverage signal.
+    matched_facets: tuple[QueryFacet, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -207,6 +214,8 @@ def _merge_duplicate_spans(spans: list[EvidenceSpan]) -> list[EvidenceSpan]:
         facet_types = tuple(dict.fromkeys([*existing.facet_types, *span.facet_types]))
         subquery_ids = tuple(dict.fromkeys([*existing.subquery_ids, *span.subquery_ids]))
         matched_terms = tuple(dict.fromkeys([*existing.matched_terms, *span.matched_terms]))
+        # QueryFacet is a frozen dataclass, so identical facets dedupe by value.
+        matched_facets = tuple(dict.fromkeys([*existing.matched_facets, *span.matched_facets]))
         quote = existing.quote if len(existing.quote) >= len(span.quote) else span.quote
         score = max(existing.score, span.score)
         merged[key] = EvidenceSpan(
@@ -219,6 +228,7 @@ def _merge_duplicate_spans(spans: list[EvidenceSpan]) -> list[EvidenceSpan]:
             subquery_ids=subquery_ids,
             matched_terms=matched_terms,
             score=score,
+            matched_facets=matched_facets,
         )
     return [merged[key] for key in order]
 
@@ -256,12 +266,15 @@ def build_evidence_set(
         quote = row.get("quote") or ""
         matched_types: list[FacetType] = []
         matched_terms: list[str] = []
+        matched_facets: list[QueryFacet] = []
         for facet, phrases in facet_phrases:
             ok, terms = _match_phrases_in_text(facet, phrases, quote)
             if not ok:
                 continue
             if facet.type not in matched_types:
                 matched_types.append(facet.type)
+            if facet not in matched_facets:
+                matched_facets.append(facet)
             for term in terms:
                 if term not in matched_terms:
                     matched_terms.append(term)
@@ -277,6 +290,7 @@ def build_evidence_set(
                 subquery_ids=_subquery_ids_from_row(row),
                 matched_terms=tuple(matched_terms),
                 score=float(row.get("score") or 0.0),
+                matched_facets=tuple(matched_facets),
             )
         )
 

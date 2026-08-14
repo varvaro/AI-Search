@@ -61,4 +61,103 @@ MAX_SUBQUERIES = 4
 # still uses search_all's normal fetch_limit; facet legs stay smaller so
 # MAX_SUBQUERIES cannot multiply the QA 500-pool.
 MULTI_QUERY_FACET_FETCH_LIMIT = 30
+# PR5 spike: auxiliary conjunctive FTS leg that ADDS candidates into search()
+# before Phase 3 rerank. Default OFF → search() path is bit-identical to pre-PR5
+# (no DF lookups, no extra MATCH). Does not change RRF, bonuses, or QE.
+AUXILIARY_TERM_COVERAGE_ENABLED = False
+# Max chunk rows returned by the single auxiliary FTS MATCH.
+AUX_FTS_LIMIT = 25
+# Max new chunk_ids appended onto top_ids (after dedupe against the RRF pool).
+AUX_MAX_NEW_IDS = 15
+# Absolute DF ceiling for an "anchor" (rare) term. Calibrated on the NDS index
+# where CRM≈36 and deska≈1693 — high-DF construction nouns must not be anchors.
+AUX_DF_RARE_MAX = 200
+# PR5.1: max chunk hits for an aux constraint prefix* (COUNT MATCH stem*).
+# Blocks Ren*/svá*/desk*-class expansions while allowing longer rare stems.
+AUX_PREFIX_DF_MAX = 150
+# PR6/PR6.2: deterministic signed-contract answer safety gate in ai_search.answer().
+# Default OFF → answer() is bit-identical to pre-PR6 (gate is never invoked).
+DOCUMENT_STATE_GATE_ENABLED = False
+# PR7.1: additive chunk-span capture in ui_services.search_all(). Default OFF →
+# search_all() returns byte-identical rows to pre-PR7.1 (the `_evidence_spans`
+# key is never created). ON only ADDS that key: quote, evidence, score, ranking
+# and result order stay untouched, and nothing consumes the key yet.
+EVIDENCE_RUNTIME_VALIDATION_ENABLED = False
+# PR8.1.1: additive Phase-3 entity match bonus (explicit query token / NOT-id
+# ⊆ document name or path). Default OFF → search() scoring is bit-identical to
+# pre-PR8.1.1. Does not change FTS, Lance, embeddings, answer(), or safety.
+ENTITY_MATCH_BONUS_ENABLED = False
+# PR8.1.2: subject→entity conjunction aliases (BOZP+smlouva→SafetyPeak, …).
+# Default OFF → bit-identical to PR8.1.1-only / pre-alias behaviour. Requires
+# the Phase-3 entity bonus hook; when ON alone it injects alias needles only.
+SUBJECT_ENTITY_ALIAS_ENABLED = False
+# PR8.2: intent-gated revision ranking (aktuální/platný/poslední/finální).
+# Default OFF → search() scoring bit-identical to pre-PR8.2. Applies only when
+# the query expresses revision intent; never a global "newer is better" rule.
+REVISION_RANKING_ENABLED = False
+# PR8.2.1: append-only revision-intent candidate recall (HMG/akt_/final/…).
+# Default OFF → search() bit-identical to pre-PR8.2.1. Does not reorder the
+# baseline pool; Phase-3 revision ranking stays a separate flag.
+REVISION_RECALL_ENABLED = False
+# PR8.3: OLD/ path safety guard in answer() — demotes OLD rows from
+# authoritative context/citations on currency/status queries. Default OFF →
+# answer() byte-identical to pre-PR8.3. Does not change search()/FTS/Lance.
+OLD_REVISION_GUARD_ENABLED = False
+# PR8.4.1: citation contract in answer() rendering (_render_answer_item and its
+# two callers). Default OFF → _render_concise_answer/_render_structured_answer
+# byte-identical to pre-PR8.4.1 (a claim item with no resolvable zdroj_index is
+# still rendered, just without its "(Zdroj: ...)" note). ON → that same item is
+# dropped instead of kept unattributed, so a factual claim can never survive
+# rendering without a verifiable source. Does not touch retrieval, ranking,
+# embeddings, PR8.1/8.2, or old_revision_guard — purely a rendering-layer gate
+# on model output that already passed through those stages.
+CITATION_CONTRACT_ENABLED = False
+# PR8.4.3: abstention override in answer() rendering. Audit (PR8.4.2) found the
+# model can return a self-contradictory JSON payload — a non-empty `body`/
+# `polozky` with valid, resolvable `zdroj_index` values AND `nenalezeno: true`
+# at the same time (nds-qa-05). `_render_concise_answer` trusted `nenalezeno`
+# unconditionally and before ever looking at `body`, discarding a genuinely
+# cited, evidence-backed answer. Default OFF → both renderers byte-identical
+# to pre-PR8.4.3 (an explicit `nenalezeno` always wins). ON → `nenalezeno` is
+# only trusted when NO item in the same response survives the PR8.4.1 citation
+# contract (enforced unconditionally for this decision, regardless of
+# CITATION_CONTRACT_ENABLED's own separate default); if at least one cited
+# item survives, it is rendered and the conflicting flag is ignored. Does not
+# touch retrieval, ranking, entity/revision (PR8.x), evidence_runtime, or the
+# Ollama prompts — a rendering-layer decision over model output only.
+ABSTENTION_OVERRIDE_ENABLED = False
+# PR8.4.4: structured-summary citation contract in `_render_structured_answer`.
+# Audit found `shrnuti` is copied into the answer as free text with no
+# `zdroj_index`, so a factual claim can survive after every `polozky` item has
+# been dropped by PR8.4.1. Default OFF → structured renderer byte-identical to
+# pre-PR8.4.4 (`shrnuti` is always emitted). ON → `shrnuti` is accompanying
+# text only: a factual structured answer is shown iff at least one `polozky`
+# item survived the existing PR8.4.1/8.4.3 filters; otherwise the renderer
+# ignores `shrnuti`/`nenalezene` and returns the canonical sentinel. Does not
+# add a source field for `shrnuti`, does not touch the concise renderer,
+# retrieval, ranking, evidence_runtime, or Ollama prompts/schema.
+STRUCTURED_SUMMARY_CITATION_ENABLED = False
+# PR8.4.6: citation contract on the free-text fallback in answer(). When the
+# JSON `format` path fails (invalid JSON / timeout / connection error) the
+# second Ollama call returns unconstrained prose and never goes through
+# `_render_*` / zdroj_index. Default OFF → that fallback text is used as-is
+# (byte-identical to pre-PR8.4.6). ON → keep the fallback only when the text
+# contains at least one document name from the answer() pool; otherwise
+# replace it with the canonical sentinel. Does not apply to a successful JSON
+# render, nor to the double-failure "Ollama je nedostupná" path. Separate from
+# CITATION_CONTRACT_ENABLED (JSON renderer only).
+FALLBACK_CITATION_CONTRACT_ENABLED = False
+# PR9.2.1: if the JSON path parses and renders, but citation contract drops
+# every substantive item (typically zdroj_index=0) leaving the canonical
+# sentinel, run the existing free-text fallback. Default OFF → answer() is
+# byte-identical to pre-PR9.2.1 (JSON sentinel is final; fallback stays
+# exception-only). Does not remap zdroj_index, does not weaken PR8.4.1–8.4.6,
+# and does not fire on explicit abstention (nenalezeno / empty items).
+JSON_SENTINEL_FALLBACK_ENABLED = False
+# PR9.3.3: pre-LLM query-focused context packing (max 4 evidence rows).
+# Default OFF → answer() sends the same answer_results to the LLM as
+# pre-PR9.3.3. ON packs ZDROJE only; retrieval, OLD guard, evidence gate,
+# document state, and citations stay on the full pool. Does not remap
+# zdroj_index 0→1 and does not change ranking.
+QUERY_FOCUSED_CONTEXT_PACKING_ENABLED = False
 MSG_PARSE_TIMEOUT_SECONDS = 120
