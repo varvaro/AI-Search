@@ -7,6 +7,7 @@ from email.parser import BytesParser
 import base64, difflib, json, logging, os, re, shutil, sqlite3, subprocess, tempfile, time
 from pathlib import Path
 import ai_search
+from metadata_rerank import parse_safe_dates
 from ai_search_config import (
     APP_SUPPORT_DIR,
     EVIDENCE_RUNTIME_VALIDATION_ENABLED,
@@ -243,6 +244,23 @@ def _content_similarity(a: str, b: str) -> float:
     if not a or not b: return 0.0
     return difflib.SequenceMatcher(None,a,b).ratio()
 
+def _filename_safe_dates(row: dict) -> frozenset:
+    """Safe dates from the document filename only. Path/quote/body are ignored
+    so a parent folder named after a date cannot create a false revision
+    identity. Uses metadata_rerank.parse_safe_dates unchanged."""
+    return frozenset(parse_safe_dates(str(row.get("document") or "")))
+
+def _should_keep_near_duplicate_due_to_distinct_dates(candidate: dict, kept_row: dict) -> bool:
+    """PR9.4.3: keep a *near* duplicate when both filenames carry safe dates
+    and those date sets differ. Does not rank revisions (no newer/final/OLD
+    preference). Exact-normalized duplicates must be rejected before this
+    helper is consulted."""
+    candidate_dates=_filename_safe_dates(candidate)
+    kept_dates=_filename_safe_dates(kept_row)
+    if not candidate_dates or not kept_dates:
+        return False
+    return candidate_dates != kept_dates
+
 def deduplicate_by_content(rows: list[dict], threshold: float = CONTENT_DUPLICATE_THRESHOLD) -> list[dict]:
     """Collapse near-duplicate chunk text across DIFFERENT documents (not just
     repeated chunks within the same path, which search_all already merges by
@@ -251,11 +269,28 @@ def deduplicate_by_content(rows: list[dict], threshold: float = CONTENT_DUPLICAT
     across ~80 dated "Kontrolní den" reports, so each counted as a distinct
     "unique" result and filled the entire top-10 sent to the LLM. Assumes `rows`
     is already sorted by score descending, so the first (best-scored) member of
-    each near-duplicate cluster is the one kept."""
+    each near-duplicate cluster is the one kept.
+
+    PR9.4.3: a later row whose quote is a *near* duplicate (similarity above
+    `threshold` but not normalized-text-equal) is kept when both filenames
+    contain distinct safe dates. Exact-normalized duplicates still collapse,
+    including dated KD boilerplate with identical text. This function never
+    reorders rows."""
     kept: list[dict] = []; kept_normalized: list[str] = []
     for row in rows:
         normalized=_normalize_chunk_text(row.get("quote",""))
-        if normalized and any(_content_similarity(normalized,existing)>threshold for existing in kept_normalized):
+        drop=False
+        if normalized:
+            for existing,existing_norm in zip(kept,kept_normalized):
+                if not existing_norm:
+                    continue
+                if existing_norm==normalized:
+                    drop=True
+                    break
+                if _content_similarity(normalized,existing_norm)>threshold and not _should_keep_near_duplicate_due_to_distinct_dates(row,existing):
+                    drop=True
+                    break
+        if drop:
             continue
         kept.append(row); kept_normalized.append(normalized)
     return kept
