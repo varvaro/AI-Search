@@ -34,12 +34,18 @@ from ai_search_config import (
     FALLBACK_CITATION_CONTRACT_ENABLED,
     JSON_SENTINEL_FALLBACK_ENABLED,
     QUERY_FOCUSED_CONTEXT_PACKING_ENABLED,
+    ENTITY_HINTS_ENABLED,
+    METADATA_RERANK_ENABLED,
+    DOCUMENT_CLASS_AFFINITY_ENABLED,
 )
 import entity_match_bonus  # PR8.1.1/8.1.2: optional Phase-3 entity name/path bonus
 import revision_ranking  # PR8.2: optional Phase-3 revision intent score
 import revision_recall  # PR8.2.1: optional append-only revision candidate recall
 import old_revision_guard  # PR8.3: optional OLD/ authority demotion in answer()
 import context_packing  # PR9.3.3: optional pre-LLM query-focused context packing
+import entity_hints  # PR9.3.4: optional entity/identifier candidates in the answer prompt
+import metadata_rerank  # PR9.4.1: optional Phase-3 token overlap / date / discriminator bonus
+import document_class_affinity  # PR9.4.2: optional Phase-3 query↔document class bonus
 from document_extractors import INDEXED_EXTS, extract_text, extract_eml, clean_cell_text, format_sheet_section
 import parsing_worker  # stable multiprocessing.Process targets, see parsing_worker.py docstring
 import query_expansion  # Query Understanding layer, opt-in via search(expand_query=True)
@@ -949,7 +955,7 @@ def sync(root, db_path, lance_dir, embeddings, progress=None, stop_event=None):
 
 RRF_RANK_CONSTANT = 60          # standard reciprocal-rank-fusion smoothing constant
 RETRIEVAL_POOL_SIZE = 100       # Phase 1: candidates pulled from each of FTS5 / vector search
-RERANK_POOL_SIZE = 30           # Phase 2: candidates re-scored with exact cosine similarity
+RERANK_POOL_SIZE = 80           # Phase 2 lookup window (PR9.4.2); questions use QA_RERANK_POOL_SIZE
 # Question-style queries ("Co chybí k předání základové desky investorovi?") spread
 # their signal across many common words ORed together in the FTS5 query, so a
 # lexically sparse but genuinely relevant chunk (e.g. a short scanned handover
@@ -1588,6 +1594,29 @@ def search(query, db_path, lance_dir, embeddings, limit=8, is_question=False, tr
             score=score+revision_detail.bonus
             match["revision_score"]=revision_detail.bonus
             match["revision"]=revision_detail.as_trace_dict()
+        # PR9.4.1: additive Phase-3 metadata bonus (generic token overlap /
+        # date whitelist / discriminator matching against name+path only).
+        # Flag OFF → no-op. skip_token_overlap avoids double-counting a query
+        # that already earned FILENAME_MATCH_BONUS via a full verbatim match.
+        metadata_detail=None
+        if METADATA_RERANK_ENABLED:
+            metadata_detail=metadata_rerank.compute_metadata_score(
+                query,row[0],row[1] or "",
+                skip_token_overlap=filename_match,
+            )
+            score=score+metadata_detail.bonus
+            match["metadata_rerank_bonus"]=metadata_detail.bonus
+            match["metadata_rerank"]=metadata_detail.as_trace_dict()
+        # PR9.4.2: additive Phase-3 query-class ↔ document-class affinity.
+        # Flag OFF → no-op. Status/signed-contract queries always contribute 0
+        # (see document_class_affinity) so LOI/signed never becomes a SoD proof.
+        class_detail=None
+        if DOCUMENT_CLASS_AFFINITY_ENABLED:
+            class_detail=document_class_affinity.compute_class_affinity(
+                query,row[0],row[1] or "",
+            )
+            score=score+class_detail.bonus
+            match["document_class_affinity"]=class_detail.as_trace_dict()
         if AUXILIARY_TERM_COVERAGE_ENABLED:
             aux_hit=cid in aux_matched_ids
             match["aux_hit"]=aux_hit
@@ -2408,6 +2437,22 @@ def answer(query, results):
         except Exception as exc:
             _search_logger.warning("CONTEXT_PACKING_SKIPPED query=%r error=%r - using full answer_results",query,exc)
             llm_results=answer_results; packed_debug=None
+    # PR9.3.4: entity/identifier candidates for the rows the LLM will actually
+    # see. Flag OFF → hints_block is "" and the prompt below is byte-identical
+    # to pre-PR9.3.4. The block only lists values already present in ZDROJE
+    # with their 1-based index; it never states an answer, is not added to
+    # `context` (so the PR8.4.6/PR9.2.1 free-text fallback prompt is untouched),
+    # and does not reach citations, the renderer, or `answer_results`.
+    hints_block=""
+    hints_debug=None
+    if ENTITY_HINTS_ENABLED:
+        try:
+            hints=entity_hints.build_entity_hints(query,llm_results)
+            hints_block=hints.as_prompt_block()
+            hints_debug=hints.as_debug_dict()
+        except Exception as exc:
+            _search_logger.warning("ENTITY_HINTS_SKIPPED query=%r error=%r - prompt unchanged",query,exc)
+            hints_block=""; hints_debug=None
     checklist=_is_checklist_query(query)
     context="\n\n".join(f"[{i}] {r['document']}"+(f" (sekce: {r['heading']})" if r.get("heading") else "")+f" | projekt {r['project']}\n{r['quote']}" for i,r in enumerate(llm_results,1)); model=COMPLEX_MODEL if len(query)>180 or len(answer_results)>6 else DEFAULT_MODEL
     guidance=STRUCTURED_JSON_GUIDANCE if checklist else CONCISE_JSON_GUIDANCE
@@ -2423,7 +2468,7 @@ def answer(query, results):
     # degrades to the old behaviour instead of surfacing as "Ollama je nedostupná".
     json_data=None
     try:
-        raw=_call_ollama(model,f"{guidance}\n\nDOTAZ: {query}\n\nZDROJE:\n{context}",format_schema=schema)
+        raw=_call_ollama(model,f"{guidance}\n\nDOTAZ: {query}\n\nZDROJE:\n{context}{hints_block}",format_schema=schema)
         json_data=json.loads(raw)
         rendered=_render_structured_answer(json_data,llm_results) if checklist else _render_concise_answer(json_data,llm_results)
     except Exception:
@@ -2490,8 +2535,12 @@ def answer(query, results):
             final["validation"]["old_revision_guard"]=old_guard_trace
         if packed_debug is not None and isinstance(final.get("validation"), dict):
             final["validation"]["context_packing"]=packed_debug
+        if hints_debug is not None and isinstance(final.get("validation"), dict):
+            final["validation"]["entity_hints"]=hints_debug
     if packed_debug is not None:
         final["_packed_context_debug"]=packed_debug
+    if hints_debug is not None:
+        final["_entity_hints_debug"]=hints_debug
     return final
 
 def main():

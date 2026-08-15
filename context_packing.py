@@ -15,6 +15,7 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 
+import answer_intent
 from query_facets import FacetType, extract_facets
 
 MAX_ROWS = 4
@@ -32,11 +33,6 @@ _STOPWORDS = frozenset({
     "ktere", "ktery", "ktera", "techto", "teto", "tohoto",
     "the", "of", "and", "or", "to",
 })
-
-_WHO_RE = re.compile(r"\b(kdo|dodavatel|zhotovitel|provadi|provadet|dela|delat)\b")
-_ID_INTENT_RE = re.compile(r"\b(zakazk|cislo|smluv|objednavk|\bnot\b)\b")
-_STANDARD_RE = re.compile(r"\b(norma|norem|predpis|pravidel|pravidla|\btp\b|\bcsn\b|\ben\b)\b")
-_TYPE_RE = re.compile(r"\b(jaky typ|jaka konstrukce|jaky druh|jaky typ|typ konstrukce)\b")
 
 _IDENTIFIER_RES = (
     re.compile(r"\bnot\d{4,}\b"),
@@ -86,12 +82,13 @@ def _bigrams(tokens: tuple[str, ...]) -> tuple[tuple[str, str], ...]:
 
 
 def _intent(query_folded: str) -> dict[str, bool]:
-    return {
-        "who": bool(_WHO_RE.search(query_folded)),
-        "identifier": bool(_ID_INTENT_RE.search(query_folded)),
-        "standard": bool(_STANDARD_RE.search(query_folded)),
-        "type": bool(_TYPE_RE.search(query_folded)),
-    }
+    """PR9.3.4.1: the rules moved to answer_intent.PACKING_PROFILE unchanged.
+
+    That profile is frozen precisely because these four flags drive the score
+    boosts below; widening them would re-rank the packed context the PR9.3.3
+    A/B validated. See answer_intent's module docstring.
+    """
+    return answer_intent.packing_flags(query_folded)
 
 
 def _doc_key(row: dict) -> str:

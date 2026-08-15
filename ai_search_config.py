@@ -160,4 +160,25 @@ JSON_SENTINEL_FALLBACK_ENABLED = False
 # document state, and citations stay on the full pool. Does not remap
 # zdroj_index 0→1 and does not change ranking.
 QUERY_FOCUSED_CONTEXT_PACKING_ENABLED = False
+# PR9.3.4: deterministic entity / identifier hint candidates appended to the
+# answer prompt after PR9.3.3 packing. Default OFF → the prompt string is
+# byte-identical to pre-PR9.3.4. ON adds one "KANDIDÁTI K OVĚŘENÍ" section
+# listing values already visible in ZDROJE with their 1-based source index;
+# it never formulates an answer. Retrieval, ranking, OLD guard, evidence gate,
+# renderer, and citations are untouched, and no zdroj_index is remapped.
+ENTITY_HINTS_ENABLED = False
+# PR9.4.1: additive Phase-3 metadata bonus in search() — generic token
+# overlap (query <-> document name/path), a safe date whitelist, and
+# structural discriminator matching (floor notation, drawing-style codes,
+# alphanumeric ids). Default OFF → search() scoring is bit-identical to
+# pre-PR9.4.1. Does not change FTS, Lance, embeddings, candidate_strategy,
+# top_ids, or any document-class/revision/recency preference; reads only
+# document name/path, never chunk heading/quote. See metadata_rerank.py.
+METADATA_RERANK_ENABLED = False
+# PR9.4.2: additive Phase-3 query-class ↔ document-class affinity in search().
+# Default OFF → no class bonus and no new match keys. Lookup rerank window
+# (RERANK_POOL_SIZE=80) is a separate, always-on pool-size change; this flag
+# only gates the affinity score. Does not change FTS, Lance, embeddings,
+# retrieval pool, QA rerank, or document_state. See document_class_affinity.py.
+DOCUMENT_CLASS_AFFINITY_ENABLED = False
 MSG_PARSE_TIMEOUT_SECONDS = 120

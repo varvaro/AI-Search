@@ -283,16 +283,16 @@ def test_default_candidate_strategy_is_legacy_and_unchanged(duplicate_heavy_back
 
 @pytest.fixture()
 def rrf_tail_backend(tmp_path):
-    """60 near-identical noise documents that all out-rank a single sparse
+    """90 near-identical noise documents that all out-rank a single sparse
     target on both channels, deterministically pushing the target to the very
-    last position (60 of 61) in both the raw BM25 list and the RRF merge -
-    below is_question=False's rerank_k=30 floor but still comfortably inside
+    last position (90 of 91) in both the raw BM25 list and the RRF merge -
+    below is_question=False's rerank_k=80 floor (PR9.4.2) but still inside
     its retrieval_k=100 floor. This reproduces the FERI production shape
     (found by a channel, discarded only by the RRF-rank cutoff) with a size
     that is cheap enough to sync() in a unit test."""
     root = tmp_path / "projekt"
     root.mkdir(parents=True)
-    for i in range(60):
+    for i in range(90):
         text = (
             f"Zápis č.{i}: Co chybí k předání základové desky investorovi? Předání "
             f"investorovi základové desky vyžaduje doplnění chybějících dokladů před "
