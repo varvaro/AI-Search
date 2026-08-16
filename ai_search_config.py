@@ -186,4 +186,9 @@ DOCUMENT_CLASS_AFFINITY_ENABLED = False
 # (no extras, no new match keys). Does not change retrieval/RRF/embeddings
 # and does not enable REVISION_RANKING_ENABLED. See family_revision_rerank.py.
 FAMILY_REVISION_RERANK_ENABLED = False
+# PR9.5.0: multi-PSM OCR candidate selection for weak single-page scans.
+# Default OFF → extract_pdf() stays on --psm 6 only, no extra tesseract
+# calls. Does not change chunks(), search(), ranking, or embeddings.
+# See pdf_ocr_candidates.py.
+PDF_MULTI_PSM_OCR_ENABLED = False
 MSG_PARSE_TIMEOUT_SECONDS = 120

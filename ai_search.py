@@ -38,6 +38,7 @@ from ai_search_config import (
     METADATA_RERANK_ENABLED,
     DOCUMENT_CLASS_AFFINITY_ENABLED,
     FAMILY_REVISION_RERANK_ENABLED,
+    PDF_MULTI_PSM_OCR_ENABLED,
 )
 import entity_match_bonus  # PR8.1.1/8.1.2: optional Phase-3 entity name/path bonus
 import revision_ranking  # PR8.2: optional Phase-3 revision intent score
@@ -48,6 +49,7 @@ import entity_hints  # PR9.3.4: optional entity/identifier candidates in the ans
 import metadata_rerank  # PR9.4.1: optional Phase-3 token overlap / date / discriminator bonus
 import document_class_affinity  # PR9.4.2: optional Phase-3 query↔document class bonus
 import family_revision_rerank  # PR9.4.4: intent-gated BM25 floor + family latest bonus
+import pdf_ocr_candidates  # PR9.5.0: multi-PSM OCR scoring (flag-gated)
 from document_extractors import INDEXED_EXTS, extract_text, extract_eml, clean_cell_text, format_sheet_section
 import parsing_worker  # stable multiprocessing.Process targets, see parsing_worker.py docstring
 import query_expansion  # Query Understanding layer, opt-in via search(expand_query=True)
@@ -499,6 +501,54 @@ def _pdf_page_marker(page,reason):
     # indexed text itself in case the log is rotated away.
     return f"[OCR SELHALA STRÁNKA {page}: {reason}]"
 
+def _tesseract_command(tesseract, image, psm):
+    return [tesseract, str(image), "stdout", "-l", "ces+eng", "--psm", str(psm)]
+
+def _ocr_indexable_text(raw_text):
+    """Join heading+body from chunks() so scoring sees what FTS will see."""
+    parts = []
+    for heading, body in chunks(raw_text or ""):
+        if heading: parts.append(heading)
+        if body: parts.append(body)
+    return "\n".join(parts)
+
+def _ocr_rendered_image(tesseract, image, deadline, allow_multi_psm):
+    """OCR one already-rendered PNG. Extra PSM runs only when the flag is on,
+    the page is a single-page OCR fallback, and psm6 indexable text is weak.
+    Extra attempts use the same _run_ocr_subprocess slot; their timeout never
+    fails the page — the best candidate so far is kept."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise subprocess.TimeoutExpired(_tesseract_command(tesseract, image, "6"), 0)
+    primary_run = _run_ocr_subprocess(
+        _tesseract_command(tesseract, image, "6"),
+        min(PDF_PAGE_OCR_TIMEOUT_SECONDS, remaining),
+    )
+    if primary_run.returncode:
+        return None
+    primary = (primary_run.stdout or "").strip()
+    if not (PDF_MULTI_PSM_OCR_ENABLED and allow_multi_psm):
+        return primary
+    candidates = [pdf_ocr_candidates.OCRCandidate("psm6", primary, _ocr_indexable_text(primary))]
+    if not pdf_ocr_candidates.is_weak(candidates[0]):
+        return primary
+    for psm in ("12", "3"):
+        remaining = deadline - time.monotonic()
+        if remaining < PDF_OCR_SECONDS_PER_PAGE_BUDGET:
+            break
+        try:
+            extra_run = _run_ocr_subprocess(
+                _tesseract_command(tesseract, image, psm),
+                min(PDF_PAGE_OCR_TIMEOUT_SECONDS, remaining),
+            )
+        except subprocess.TimeoutExpired:
+            break
+        if extra_run.returncode:
+            continue
+        extra = (extra_run.stdout or "").strip()
+        candidates.append(pdf_ocr_candidates.OCRCandidate(f"psm{psm}", extra, _ocr_indexable_text(extra)))
+    return pdf_ocr_candidates.choose_best(candidates).raw_text
+
 def _extract_pdf_per_page(path,page_count,deadline):
     pdftoppm=_required_system_tool("pdftoppm"); tesseract=_required_system_tool("tesseract")
     with tempfile.TemporaryDirectory(prefix="ai-search-ocr-") as folder:
@@ -518,13 +568,11 @@ def _extract_pdf_per_page(path,page_count,deadline):
             image=images[0]; remaining=deadline-time.monotonic()
             if remaining<=0:
                 parts.append(_pdf_page_marker(page,"překročen časový limit dokumentu")); failed+=1; _cleanup_page_images(folder_path); continue
-            try: run=_run_ocr_subprocess([tesseract,str(image),"stdout","-l","ces+eng","--psm","6"],min(PDF_PAGE_OCR_TIMEOUT_SECONDS,remaining))
+            try: text=_ocr_rendered_image(tesseract,image,deadline,allow_multi_psm=(page_count==1))
             except subprocess.TimeoutExpired: parts.append(_pdf_page_marker(page,"OCR překročil časový limit")); failed+=1
             else:
-                if run.returncode: parts.append(_pdf_page_marker(page,"OCR selhal")); failed+=1
-                else:
-                    text=run.stdout.strip()
-                    parts.append(text if text else f"[OCR PRÁZDNÁ STRÁNKA {page}]")
+                if text is None: parts.append(_pdf_page_marker(page,"OCR selhal")); failed+=1
+                else: parts.append(text if text else f"[OCR PRÁZDNÁ STRÁNKA {page}]")
             _cleanup_page_images(folder_path)
         if failed==page_count: raise RuntimeError(f"OCR selhalo na všech {page_count} stránkách PDF")
         return "\n".join(parts)
@@ -544,17 +592,16 @@ def _extract_pdf_whole_document(path,deadline):
         except subprocess.TimeoutExpired as exc: raise TimeoutError("Převod PDF pro OCR překročil časový limit") from exc
         if rendered.returncode: raise RuntimeError("PDF nelze převést pro OCR: "+(rendered.stderr.strip() or str(rendered.returncode)))
         images=sorted(folder_path.glob("page-*.png")); parts=[]; failed=0
+        allow_multi_psm=len(images)==1
         for index,image in enumerate(images,1):
             remaining=deadline-time.monotonic()
             if remaining<=0: parts.append(_pdf_page_marker(index,"překročen časový limit dokumentu")); failed+=1
             else:
-                try: run=_run_ocr_subprocess([tesseract,str(image),"stdout","-l","ces+eng","--psm","6"],min(PDF_PAGE_OCR_TIMEOUT_SECONDS,remaining))
+                try: text=_ocr_rendered_image(tesseract,image,deadline,allow_multi_psm=allow_multi_psm)
                 except subprocess.TimeoutExpired: parts.append(_pdf_page_marker(index,"OCR překročil časový limit")); failed+=1
                 else:
-                    if run.returncode: parts.append(_pdf_page_marker(index,"OCR selhal")); failed+=1
-                    else:
-                        text=run.stdout.strip()
-                        parts.append(text if text else f"[OCR PRÁZDNÁ STRÁNKA {index}]")
+                    if text is None: parts.append(_pdf_page_marker(index,"OCR selhal")); failed+=1
+                    else: parts.append(text if text else f"[OCR PRÁZDNÁ STRÁNKA {index}]")
             try: image.unlink()
             except OSError: pass
         if images and failed==len(images): raise RuntimeError(f"OCR selhalo na všech {len(images)} stránkách PDF")
