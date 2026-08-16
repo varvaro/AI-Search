@@ -49,6 +49,7 @@ import entity_hints  # PR9.3.4: optional entity/identifier candidates in the ans
 import metadata_rerank  # PR9.4.1: optional Phase-3 token overlap / date / discriminator bonus
 import document_class_affinity  # PR9.4.2: optional Phase-3 query↔document class bonus
 import drawing_navigation  # PR9.7.3: deterministic drawing-navigation answers
+import drawing_local_evidence  # PR9.7.4: document-local drawing evidence quote
 import family_revision_rerank  # PR9.4.4: intent-gated BM25 floor + family latest bonus
 import pdf_ocr_candidates  # PR9.5.0: multi-PSM OCR scoring (flag-gated)
 from document_extractors import INDEXED_EXTS, extract_text, extract_eml, clean_cell_text, format_sheet_section
@@ -2439,11 +2440,16 @@ def answer(query, results):
     if not results: return {"answer":"Odpověď nelze vytvořit bez citací.","citations":[],"confidence":"red"}
     # PR9.7.3: drawing-navigation queries are answered from ranked results
     # without Ollama. Non-drawing queries never enter this branch.
-    drawing_text=drawing_navigation.try_render(query,results)
+    drawing_results=results
+    if drawing_navigation.is_drawing_navigation_query(query):
+        drawing_results=drawing_local_evidence.enrich_results(
+            query,results,drawing_navigation.derive_requested_subtypes(query)
+        )
+    drawing_text=drawing_navigation.try_render(query,drawing_results)
     if drawing_text is not None:
         confidence_level,confidence_reason=_answer_confidence(query,results)
         confidence_block=f"\n\nJistota odpovědi:\n{CONFIDENCE_LABELS[confidence_level]}\n- {confidence_reason}"
-        return {"answer":drawing_text+confidence_block,"citations":results,"model":"drawing-navigation","confidence":confidence_level}
+        return {"answer":drawing_text+confidence_block,"citations":drawing_results,"model":"drawing-navigation","confidence":confidence_level}
     # PR8.3: demote OLD/ rows from authoritative context on currency/status
     # queries. Flag OFF → answer_results IS results (same object, not just
     # equal) — byte-identical AND identity-identical to pre-PR8.3. search()
