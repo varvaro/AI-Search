@@ -1,4 +1,4 @@
-"""PR9.4.2 — Query-class ↔ document-class affinity (experimental, flag-gated).
+"""PR9.4.2 / PR9.6.0 — Query-class ↔ document-class affinity (flag-gated).
 
 Additive Phase-3 score from a *generic* compatibility between the query's
 document-type intent and one candidate's filename/path/extension.
@@ -9,10 +9,13 @@ Does NOT:
   * apply recency, revision, OLD/final/návrh, or signed-state preference
   * hardcode vendors, NOT-ids, drawing numbers, or project folders
   * replace document_state (signed-contract answer safety stays there)
+  * boost every DRAWING filename on a DRAWING query (PR9.6.0: match bonus
+    stays 0 for that pair; only textual/admin mismatch is applied)
 
 Status / signed-contract questions always return bonus=0. A letter of intent
 (LOI) is never treated as a full CONTRACT match. See
-tests/test_document_class_affinity_pr942.py.
+tests/test_document_class_affinity_pr942.py and
+tests/test_document_class_affinity_pr960.py.
 
 `fold()` is local, matching this repo's per-module normalization convention.
 """
@@ -54,6 +57,7 @@ class DocumentClass(str, Enum):
     BUDGET = "BUDGET"
     OFFER = "OFFER"
     TECHNICAL_REPORT = "TECHNICAL_REPORT"
+    REGULATORY = "REGULATORY"
     UNKNOWN = "UNKNOWN"
 
 
@@ -89,6 +93,9 @@ _D_BUDGET = re.compile(r"rozpocet")
 _D_OFFER = re.compile(r"nabidk|cenova\s+nabidka|poptavk")
 _D_CONTRACT = re.compile(r"smlouv|(?<![a-z0-9])sod(?![a-z0-9])")
 _D_TZ = re.compile(r"technick\w*\s*zprav|(?<![a-z0-9])tz(?![a-z0-9])")
+# Administrative / regulatory filings. Filename+path only; stems are
+# declension-tolerant and must not fire on ordinary construction nouns.
+_D_REGULATORY = re.compile(r"rozhodnut|povolen|podmink|stanovisk|vyjadren")
 _D_DRAWING_WORD = re.compile(r"vykres|schem")
 _D_DRAWING_CODE = re.compile(r"(?<![a-z0-9])[a-z]\.\d+(?:\.\d+){1,4}(?![a-z0-9])")
 
@@ -149,6 +156,8 @@ def classify_document(name: str, path: str = "") -> DocumentClass:
         return DocumentClass.CONTRACT
     if _D_TZ.search(name_f) or _D_TZ.search(path_f):
         return DocumentClass.TECHNICAL_REPORT
+    if _D_REGULATORY.search(blob):
+        return DocumentClass.REGULATORY
     if _D_DRAWING_WORD.search(blob):
         return DocumentClass.DRAWING
     if ext == ".pdf" and _D_DRAWING_CODE.search(name_f):
@@ -163,6 +172,7 @@ _AFFINITY: dict[QueryClass, tuple[frozenset[DocumentClass], frozenset[DocumentCl
         frozenset({
             DocumentClass.CONTRACT, DocumentClass.MINUTES,
             DocumentClass.BUDGET, DocumentClass.OFFER, DocumentClass.LETTER_OF_INTENT,
+            DocumentClass.TECHNICAL_REPORT, DocumentClass.REGULATORY,
         }),
     ),
     QueryClass.MINUTES: (
@@ -226,6 +236,14 @@ def compute_class_affinity(query: str, document_name: str, document_path: str = 
         )
     match, mismatch = _AFFINITY.get(qclass, (frozenset(), frozenset()))
     if dclass in match:
+        # PR9.6.0: a DRAWING query must not boost every DRAWING filename
+        # (+0.03 promoted off-topic sheets over the topic hit). Other
+        # query classes keep the historical match bonus.
+        if qclass is QueryClass.DRAWING:
+            return ClassAffinityDetail(
+                query_class=qclass, document_class=dclass,
+                bonus=0.0, reason="drawing_match_neutral",
+            )
         return ClassAffinityDetail(
             query_class=qclass, document_class=dclass,
             bonus=CLASS_MATCH_BONUS, reason="class_match",
