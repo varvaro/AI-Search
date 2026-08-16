@@ -118,14 +118,18 @@ CITATION_CONTRACT_ENABLED = False
 # at the same time (nds-qa-05). `_render_concise_answer` trusted `nenalezeno`
 # unconditionally and before ever looking at `body`, discarding a genuinely
 # cited, evidence-backed answer. Default OFF → both renderers byte-identical
-# to pre-PR8.4.3 (an explicit `nenalezeno` always wins). ON → `nenalezeno` is
+# to pre-PR8.4.3 (an explicit `nenalezeno` always wins). Default ON after
+# PR9.7.0: a cited body item must not be discarded because the model also
+# set `nenalezeno: true` (RETENCE drawing answer). ON → `nenalezeno` is
 # only trusted when NO item in the same response survives the PR8.4.1 citation
 # contract (enforced unconditionally for this decision, regardless of
 # CITATION_CONTRACT_ENABLED's own separate default); if at least one cited
-# item survives, it is rendered and the conflicting flag is ignored. Does not
-# touch retrieval, ranking, entity/revision (PR8.x), evidence_runtime, or the
-# Ollama prompts — a rendering-layer decision over model output only.
-ABSTENTION_OVERRIDE_ENABLED = False
+# item survives, it is rendered and the conflicting flag is ignored. Empty
+# or uncited body + `nenalezeno` still abstains. Flag OFF remains a no-op
+# (explicit `nenalezeno` always wins). Does not touch retrieval, ranking,
+# entity/revision (PR8.x), evidence_runtime, or the Ollama prompts — a
+# rendering-layer decision over model output only.
+ABSTENTION_OVERRIDE_ENABLED = True
 # PR8.4.4: structured-summary citation contract in `_render_structured_answer`.
 # Audit found `shrnuti` is copied into the answer as free text with no
 # `zdroj_index`, so a factual claim can survive after every `polozky` item has

@@ -45,12 +45,12 @@ def _set_flags(monkeypatch, *, abstention_override, citation_contract=False):
 
 
 # ---------------------------------------------------------------------------
-# 1. Flag default OFF
+# 1. Flag default ON (PR9.7.1). OFF remains monkeypatch-testable below.
 # ---------------------------------------------------------------------------
 
-def test_flag_default_off():
-    assert ai_search_config.ABSTENTION_OVERRIDE_ENABLED is False
-    assert ai_search.ABSTENTION_OVERRIDE_ENABLED is False
+def test_flag_default_is_on():
+    assert ai_search_config.ABSTENTION_OVERRIDE_ENABLED is True
+    assert ai_search.ABSTENTION_OVERRIDE_ENABLED is True
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +122,72 @@ def test_concise_override_enforces_citation_even_if_contract_flag_off(monkeypatc
         "body": [{"text": "Nejisté tvrzení bez zdroje.", "zdroj_index": None, "typ": "fakt"}],
     }
     assert ai_search._render_concise_answer(data, RESULTS) == "Nenalezeno v indexovaných dokumentech."
+
+
+def test_concise_flag_on_nonexistent_source_index_keeps_sentinel(monkeypatch):
+    """nenalezeno=true + only an out-of-range zdroj_index → abstention."""
+    _set_flags(monkeypatch, abstention_override=True)
+    data = {
+        "nenalezeno": True,
+        "body": [{"text": "Unsupported claim.", "zdroj_index": 99, "typ": "fakt"}],
+    }
+    assert ai_search._render_concise_answer(data, RESULTS) == "Nenalezeno v indexovaných dokumentech."
+
+
+def test_concise_nenalezeno_false_valid_body_unchanged(monkeypatch):
+    _set_flags(monkeypatch, abstention_override=True)
+    data = {
+        "nenalezeno": False,
+        "body": [{"text": "Validní tvrzení.", "zdroj_index": 1, "typ": "fakt"}],
+    }
+    rendered = ai_search._render_concise_answer(data, RESULTS)
+    assert "Validní tvrzení." in rendered
+    assert f"(Zdroj: {ROW_A['document']})" in rendered
+    assert rendered != "Nenalezeno v indexovaných dokumentech."
+
+
+RETENCE_FAIL_ROWS = [
+    _row("32_RETENCE.pdf", path="/proj/32_RETENCE.pdf",
+         quote="Rez retenční nádrží ... Řez nádrží na dešťovou vodu"),
+    _row("03_ÚMČ_společné pravomocné.pdf"),
+    _row("PLÁN BOZP NA STAVBU Narodni dum Smichov - garaze A1.doc"),
+]
+RETENCE_FAIL_PAYLOAD = {
+    "body": [
+        {
+            "text": "Rez retenční nádrží ... Řez nádrží na dešťovou vodu",
+            "zdroj_index": 1,
+            "typ": "fakt",
+        },
+        {
+            "text": "Retenční železobetonová nádrž o rozměrech 9,9 x 3,8 x 1,7 m a objemu 102,6 m³",
+            "zdroj_index": 2,
+            "typ": "fakt",
+        },
+        {
+            "text": "Situační výkres stavby",
+            "zdroj_index": 3,
+            "typ": "fakt",
+        },
+    ],
+    "nenalezeno": True,
+}
+
+
+def test_retence_payload_flag_off_keeps_sentinel(monkeypatch):
+    """PR9.7.0 live fail: override OFF discards the cited section."""
+    _set_flags(monkeypatch, abstention_override=False)
+    rendered = ai_search._render_concise_answer(RETENCE_FAIL_PAYLOAD, RETENCE_FAIL_ROWS)
+    assert rendered == "Nenalezeno v indexovaných dokumentech."
+
+
+def test_retence_payload_flag_on_preserves_cited_section(monkeypatch):
+    """PR9.7.1: same payload keeps the cited 32_RETENCE section."""
+    _set_flags(monkeypatch, abstention_override=True)
+    rendered = ai_search._render_concise_answer(RETENCE_FAIL_PAYLOAD, RETENCE_FAIL_ROWS)
+    assert "Rez retenční nádrží" in rendered or "Řez nádrží na dešťovou vodu" in rendered
+    assert "32_RETENCE.pdf" in rendered
+    assert rendered != "Nenalezeno v indexovaných dokumentech."
 
 
 def test_concise_flag_on_does_not_affect_non_abstention_path(monkeypatch):
