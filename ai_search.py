@@ -37,6 +37,7 @@ from ai_search_config import (
     ENTITY_HINTS_ENABLED,
     METADATA_RERANK_ENABLED,
     DOCUMENT_CLASS_AFFINITY_ENABLED,
+    FAMILY_REVISION_RERANK_ENABLED,
 )
 import entity_match_bonus  # PR8.1.1/8.1.2: optional Phase-3 entity name/path bonus
 import revision_ranking  # PR8.2: optional Phase-3 revision intent score
@@ -46,6 +47,7 @@ import context_packing  # PR9.3.3: optional pre-LLM query-focused context packin
 import entity_hints  # PR9.3.4: optional entity/identifier candidates in the answer prompt
 import metadata_rerank  # PR9.4.1: optional Phase-3 token overlap / date / discriminator bonus
 import document_class_affinity  # PR9.4.2: optional Phase-3 query↔document class bonus
+import family_revision_rerank  # PR9.4.4: intent-gated BM25 floor + family latest bonus
 from document_extractors import INDEXED_EXTS, extract_text, extract_eml, clean_cell_text, format_sheet_section
 import parsing_worker  # stable multiprocessing.Process targets, see parsing_worker.py docstring
 import query_expansion  # Query Understanding layer, opt-in via search(expand_query=True)
@@ -1345,7 +1347,8 @@ def search(query, db_path, lance_dir, embeddings, limit=8, is_question=False, tr
     with database(db_path) as con: lexical=con.execute("SELECT chunk_id FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY rank LIMIT ?",(terms,retrieval_k)).fetchall() if terms else []
     fts_ids=[cid for (cid,) in lexical]; table=lance_table(lance_dir)
     doc_id_by_chunk={}
-    if _tracing and fts_ids:
+    _family_revision_intent=bool(FAMILY_REVISION_RERANK_ENABLED) and family_revision_rerank.has_revision_intent(query)
+    if (_tracing or _family_revision_intent) and fts_ids:
         # One batched lookup (not one query per candidate) purely to populate
         # SearchTrace.bm25_candidates[*]["document_id"] - chunks_fts itself has
         # no document_id column. Only ever runs when a trace is attached.
@@ -1451,6 +1454,20 @@ def search(query, db_path, lance_dir, embeddings, limit=8, is_question=False, tr
         except Exception as exc:
             rev_recall_trace={"activated":False,"reason":"error","error":repr(exc),
                               "added_ids":[],"added_count":0,"matched_document_names":[]}
+
+    # PR9.4.4: intent-gated BM25-floor admission. Append-only onto top_ids.
+    # Uses chunk ids already in fts_ids (no new FTS). fusion_order / rrf_scores
+    # stay unchanged. Flag OFF or no revision intent → this block is a no-op.
+    family_admission_ids=set()
+    if _family_revision_intent:
+        vector_doc_id_by_chunk={row["id"]:row.get("document_id") for row in vector_rows}
+        for cid,did in vector_doc_id_by_chunk.items():
+            if cid not in doc_id_by_chunk and did is not None:
+                doc_id_by_chunk[cid]=did
+        extras=family_revision_rerank.select_bm25_floor_chunk_ids(fts_ids,top_ids,doc_id_by_chunk)
+        if extras:
+            top_ids=list(top_ids)+list(extras)
+            family_admission_ids=set(extras)
 
     if _tracing:
         fts_rank_of={cid:i for i,cid in enumerate(fts_ids)}; vector_rank_of={cid:i for i,cid in enumerate(vector_ids)}
@@ -1617,6 +1634,8 @@ def search(query, db_path, lance_dir, embeddings, limit=8, is_question=False, tr
             )
             score=score+class_detail.bonus
             match["document_class_affinity"]=class_detail.as_trace_dict()
+        if _family_revision_intent:
+            match["admission_source"]="bm25_revision_floor" if cid in family_admission_ids else "fusion"
         if AUXILIARY_TERM_COVERAGE_ENABLED:
             aux_hit=cid in aux_matched_ids
             match["aux_hit"]=aux_hit
@@ -1631,6 +1650,11 @@ def search(query, db_path, lance_dir, embeddings, limit=8, is_question=False, tr
         # negligible next to the SQLite query on the line above; only
         # runs at all when a trace is attached.
         if _tracing: trace_ids.append(cid)
+    if _family_revision_intent and output:
+        for row, detail in zip(output, family_revision_rerank.annotate_family_revision(output, query)):
+            row["score"]=row["score"]+detail.bonus
+            row["match"]["family_revision_bonus"]=detail.bonus
+            row["match"]["family_revision"]=detail.as_trace_dict()
     result=sorted(output,key=lambda row:row["score"],reverse=True)
     if _tracing:
         # Sorting the *indices* by the same key/reverse as `result` above is

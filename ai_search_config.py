@@ -181,4 +181,9 @@ METADATA_RERANK_ENABLED = False
 # only gates the affinity score. Does not change FTS, Lance, embeddings,
 # retrieval pool, QA rerank, or document_state. See document_class_affinity.py.
 DOCUMENT_CLASS_AFFINITY_ENABLED = False
+# PR9.4.4: intent-gated BM25-floor Phase-3 admission + family-local latest
+# revision bonus (+0.03). Default OFF → search() bit-identical to pre-PR9.4.4
+# (no extras, no new match keys). Does not change retrieval/RRF/embeddings
+# and does not enable REVISION_RANKING_ENABLED. See family_revision_rerank.py.
+FAMILY_REVISION_RERANK_ENABLED = False
 MSG_PARSE_TIMEOUT_SECONDS = 120
