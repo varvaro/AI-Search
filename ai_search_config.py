@@ -175,12 +175,13 @@ ENTITY_HINTS_ENABLED = False
 # top_ids, or any document-class/revision/recency preference; reads only
 # document name/path, never chunk heading/quote. See metadata_rerank.py.
 METADATA_RERANK_ENABLED = False
-# PR9.4.2: additive Phase-3 query-class ↔ document-class affinity in search().
-# Default OFF → no class bonus and no new match keys. Lookup rerank window
-# (RERANK_POOL_SIZE=80) is a separate, always-on pool-size change; this flag
-# only gates the affinity score. Does not change FTS, Lance, embeddings,
-# retrieval pool, QA rerank, or document_state. See document_class_affinity.py.
-DOCUMENT_CLASS_AFFINITY_ENABLED = False
+# PR9.4.2 / PR9.6.1: additive Phase-3 query-class ↔ document-class affinity.
+# Default ON after PR9.6.0 validation (drawing queries demote REGULATORY /
+# TECHNICAL_REPORT; DRAWING filenames are not boosted). Flag OFF remains a
+# no-op. Lookup rerank window (RERANK_POOL_SIZE=80) is a separate, always-on
+# pool-size change. Does not change FTS, Lance, embeddings, retrieval pool,
+# QA rerank, or document_state. See document_class_affinity.py.
+DOCUMENT_CLASS_AFFINITY_ENABLED = True
 # PR9.4.4: intent-gated BM25-floor Phase-3 admission + family-local latest
 # revision bonus (+0.03). Default OFF → search() bit-identical to pre-PR9.4.4
 # (no extras, no new match keys). Does not change retrieval/RRF/embeddings

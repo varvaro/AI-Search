@@ -37,9 +37,9 @@ def backend(tmp_path):
 
 # --- flag / identity ----------------------------------------------------------
 
-def test_flag_default_is_off():
-    assert ai_search_config.DOCUMENT_CLASS_AFFINITY_ENABLED is False
-    assert ai_search.DOCUMENT_CLASS_AFFINITY_ENABLED is False
+def test_flag_default_is_on():
+    assert ai_search_config.DOCUMENT_CLASS_AFFINITY_ENABLED is True
+    assert ai_search.DOCUMENT_CLASS_AFFINITY_ENABLED is True
 
 
 def test_flag_off_has_no_trace_key(backend, monkeypatch):
